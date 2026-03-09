@@ -35,7 +35,7 @@ export class GoogleDriveService {
   private readonly serviceAccountKeyJson?: string;
   private readonly serviceAccountKeyJsonBase64?: string;
   private readonly sourceByFileId = new Map<string, 'oauth' | 'service'>();
-  private readonly folderDriveIdCache = new Map<string, string | null>();
+  private readonly folderMetaCache = new Map<string, { id: string; driveId: string | null }>();
 
   constructor(private readonly config: ConfigService) {
     this.folderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_FOLDER_ID')) ?? '';
@@ -123,10 +123,11 @@ export class GoogleDriveService {
 
   async uploadTextFile(name: string, content: string): Promise<{ id: string; link: string }> {
     const drive = await this.getOAuthDrive();
+    const resultParentId = this.resultFolderId ? await this.resolveFolderId(drive, this.resultFolderId) : undefined;
     const res = await drive.files.create({
       requestBody: {
         name,
-        parents: this.resultFolderId ? [this.resultFolderId] : undefined,
+        parents: resultParentId ? [resultParentId] : undefined,
         mimeType: 'text/plain',
       },
       media: { mimeType: 'text/plain', body: content },
@@ -195,7 +196,9 @@ export class GoogleDriveService {
 
     for (const client of await this.getIngestClientsByPriority(fileId)) {
       try {
-        await this.moveFileBetweenFolders(client.drive, fileId, this.folderId, this.resultFolderId);
+        const fromFolderId = await this.resolveFolderId(client.drive, this.folderId);
+        const toFolderId = await this.resolveFolderId(client.drive, this.resultFolderId);
+        await this.moveFileBetweenFolders(client.drive, fileId, fromFolderId, toFolderId);
         this.logger.log(`Moved INGEST file via ${client.kind}: ${fileId}`);
         return { id: fileId, link: this.fileLink(fileId) };
       } catch (err) {
@@ -205,10 +208,11 @@ export class GoogleDriveService {
     }
 
     const oauth = await this.getOAuthDrive();
+    const resultParentId = await this.resolveFolderId(oauth, this.resultFolderId);
     const uploaded = await oauth.files.create({
       requestBody: {
         name: originalName,
-        parents: [this.resultFolderId],
+        parents: [resultParentId],
         mimeType: this.videoMimeByName(originalName),
       },
       media: {
@@ -254,19 +258,47 @@ export class GoogleDriveService {
     if (!folderId) {
       return [];
     }
-    const driveId = await this.getFolderDriveId(drive, folderId);
-    const res = await drive.files.list({
-      q: `'${folderId}' in parents and trashed = false`,
-      fields: 'files(id,name,mimeType,createdTime)',
-      pageSize: 1000,
-      includeItemsFromAllDrives: true,
-      supportsAllDrives: true,
-      orderBy: 'createdTime asc',
-      corpora: driveId ? 'drive' : 'allDrives',
-      driveId: driveId ?? undefined,
+    const target = await this.resolveFolderTarget(drive, folderId);
+    const q = `'${target.id}' in parents and trashed = false`;
+    const attempts: Array<{ name: string; params: Partial<drive_v3.Params$Resource$Files$List> }> = [];
+    if (target.driveId) {
+      attempts.push({
+        name: 'drive',
+        params: { corpora: 'drive', driveId: target.driveId },
+      });
+    }
+    attempts.push({
+      name: 'allDrives',
+      params: { corpora: 'allDrives' },
+    });
+    attempts.push({
+      name: 'user',
+      params: { corpora: 'user' },
     });
 
-    const files = res.data.files ?? [];
+    const merged = new Map<string, drive_v3.Schema$File>();
+    for (const attempt of attempts) {
+      const files = await this.listFilesPaged(drive, {
+        q,
+        fields: 'nextPageToken,files(id,name,mimeType,createdTime)',
+        pageSize: 1000,
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        orderBy: 'createdTime asc',
+        ...attempt.params,
+      });
+      this.logger.debug(`Folder scan strategy=${attempt.name} folder=${target.id} files=${files.length}`);
+      for (const file of files) {
+        if (file.id) {
+          merged.set(file.id, file);
+        }
+      }
+      if (merged.size > 0) {
+        break;
+      }
+    }
+
+    const files = Array.from(merged.values());
     return files
       .filter((file) => Boolean(file.id && file.name))
       .filter((file) => {
@@ -283,24 +315,68 @@ export class GoogleDriveService {
       }));
   }
 
-  private async getFolderDriveId(drive: drive_v3.Drive, folderId: string): Promise<string | null> {
-    if (this.folderDriveIdCache.has(folderId)) {
-      return this.folderDriveIdCache.get(folderId) ?? null;
+  private async resolveFolderTarget(
+    drive: drive_v3.Drive,
+    folderId: string,
+  ): Promise<{ id: string; driveId: string | null }> {
+    if (this.folderMetaCache.has(folderId)) {
+      return this.folderMetaCache.get(folderId) as { id: string; driveId: string | null };
     }
 
     try {
       const meta = await drive.files.get({
         fileId: folderId,
-        fields: 'id,driveId',
+        fields: 'id,driveId,mimeType,shortcutDetails',
         supportsAllDrives: true,
       });
-      const driveId = meta.data.driveId ?? null;
-      this.folderDriveIdCache.set(folderId, driveId);
-      return driveId;
+
+      const mimeType = meta.data.mimeType ?? '';
+      if (
+        mimeType === 'application/vnd.google-apps.shortcut' &&
+        meta.data.shortcutDetails?.targetId &&
+        meta.data.shortcutDetails.targetMimeType === 'application/vnd.google-apps.folder'
+      ) {
+        const targetId = meta.data.shortcutDetails.targetId;
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,driveId',
+          supportsAllDrives: true,
+        });
+        const resolved = { id: targetId, driveId: targetMeta.data.driveId ?? null };
+        this.folderMetaCache.set(folderId, resolved);
+        return resolved;
+      }
+
+      const resolved = { id: folderId, driveId: meta.data.driveId ?? null };
+      this.folderMetaCache.set(folderId, resolved);
+      return resolved;
     } catch {
-      this.folderDriveIdCache.set(folderId, null);
-      return null;
+      const fallback = { id: folderId, driveId: null };
+      this.folderMetaCache.set(folderId, fallback);
+      return fallback;
     }
+  }
+
+  private async listFilesPaged(
+    drive: drive_v3.Drive,
+    params: drive_v3.Params$Resource$Files$List,
+  ): Promise<drive_v3.Schema$File[]> {
+    const all: drive_v3.Schema$File[] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await drive.files.list({
+        ...params,
+        pageToken,
+      });
+      all.push(...(res.data.files ?? []));
+      pageToken = res.data.nextPageToken ?? undefined;
+    } while (pageToken);
+    return all;
+  }
+
+  private async resolveFolderId(drive: drive_v3.Drive, folderId: string): Promise<string> {
+    const target = await this.resolveFolderTarget(drive, folderId);
+    return target.id;
   }
 
   private async listFolderFilesMerged(folderId: string, kind: 'video' | 'text'): Promise<DriveFileInfo[]> {
@@ -444,8 +520,10 @@ export class GoogleDriveService {
     let lastError: string | undefined;
     for (const client of await this.getIngestClientsByPriority(fileId)) {
       try {
-        await this.moveFileBetweenFolders(client.drive, fileId, fromFolderId, toFolderId);
-        this.logger.log(`Moved file ${fileId} via ${client.kind}: ${fromFolderId} -> ${toFolderId}`);
+        const resolvedFrom = await this.resolveFolderId(client.drive, fromFolderId);
+        const resolvedTo = await this.resolveFolderId(client.drive, toFolderId);
+        await this.moveFileBetweenFolders(client.drive, fileId, resolvedFrom, resolvedTo);
+        this.logger.log(`Moved file ${fileId} via ${client.kind}: ${resolvedFrom} -> ${resolvedTo}`);
         return;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
