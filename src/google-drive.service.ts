@@ -36,6 +36,7 @@ export class GoogleDriveService {
   private readonly serviceAccountKeyJsonBase64?: string;
   private readonly sourceByFileId = new Map<string, 'oauth' | 'service'>();
   private readonly folderMetaCache = new Map<string, { id: string; driveId: string | null }>();
+  private oauthScopesLogged = false;
 
   constructor(private readonly config: ConfigService) {
     this.folderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_FOLDER_ID')) ?? '';
@@ -424,6 +425,16 @@ export class GoogleDriveService {
       if (!token.token) {
         throw new Error('OAuth refresh returned empty access token');
       }
+      if (!this.oauthScopesLogged) {
+        try {
+          const tokenInfo = await oauth2.getTokenInfo(token.token);
+          const scopes = tokenInfo.scopes?.join(' ') || 'unknown';
+          this.logger.debug(`OAuth token scopes: ${scopes}`);
+          this.oauthScopesLogged = true;
+        } catch (scopeErr) {
+          this.logger.debug(`Cannot read OAuth token scopes: ${scopeErr}`);
+        }
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`Google Drive OAuth initialization failed: ${message}`);
@@ -550,7 +561,7 @@ export class GoogleDriveService {
       return undefined;
     }
 
-    const parsed = JSON.parse(raw) as {
+    const parsed = this.parseJsonObject(raw, 'Google OAuth client JSON') as {
       installed?: { client_id?: string; client_secret?: string };
       web?: { client_id?: string; client_secret?: string };
     };
@@ -575,7 +586,7 @@ export class GoogleDriveService {
       throw new Error('Google service account credentials are missing.');
     }
 
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = this.parseJsonObject(raw, 'Google service account JSON') as Record<string, unknown>;
     const privateKey = typeof parsed.private_key === 'string' ? this.normalizePrivateKey(parsed.private_key) : undefined;
     const clientEmail = typeof parsed.client_email === 'string' ? parsed.client_email.trim() : undefined;
 
@@ -602,6 +613,21 @@ export class GoogleDriveService {
     return Buffer.from(value, 'base64').toString('utf8');
   }
 
+  private parseJsonObject(raw: string, label: string): unknown {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      const trimmed = raw.trim();
+      if (
+        (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+        (trimmed.startsWith('"') && trimmed.endsWith('"'))
+      ) {
+        return JSON.parse(trimmed.slice(1, -1));
+      }
+      throw new Error(`${label} is not valid JSON.`);
+    }
+  }
+
   private async createServiceDrive(): Promise<drive_v3.Drive | undefined> {
     try {
       const scopes = ['https://www.googleapis.com/auth/drive'];
@@ -621,11 +647,24 @@ export class GoogleDriveService {
   }
 
   private normalizePrivateKey(value: string): string {
-    return value
+    const normalized = value
       .trim()
       .replace(/^"|"$/g, '')
+      .replace(/^'|'$/g, '')
       .replace(/\r\n/g, '\n')
       .replace(/\\n/g, '\n');
+
+    const begin = '-----BEGIN PRIVATE KEY-----';
+    const end = '-----END PRIVATE KEY-----';
+    if (!normalized.includes(begin) || !normalized.includes(end)) {
+      return normalized;
+    }
+
+    const bodyRaw = normalized
+      .slice(normalized.indexOf(begin) + begin.length, normalized.indexOf(end))
+      .replace(/[\s\r\n]+/g, '');
+    const body = bodyRaw.match(/.{1,64}/g)?.join('\n') ?? bodyRaw;
+    return `${begin}\n${body}\n${end}`;
   }
 
   private assertServiceAccountPrivateKey(privateKey: string): void {

@@ -37,6 +37,11 @@ export class TelegramBotService {
     }
 
     this.bot = new Telegraf(this.token);
+    try {
+      await this.bot.telegram.deleteWebhook({ drop_pending_updates: false });
+    } catch (err) {
+      this.logger.warn(`Cannot delete webhook before polling start: ${err}`);
+    }
     this.startPollingLoop();
 
     process.once('SIGINT', () => this.stopPolling());
@@ -114,7 +119,12 @@ export class TelegramBotService {
           await this.handleRawUpdate(update);
         }
       } catch (err) {
-        this.logger.error(`Telegram polling error: ${err}`);
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('409')) {
+          this.logger.warn(`Telegram polling conflict (409). Another getUpdates session is active.`);
+        } else {
+          this.logger.error(`Telegram polling error: ${message}`);
+        }
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }

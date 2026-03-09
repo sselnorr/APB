@@ -67,5 +67,7 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 downloads
 
-client_secret_897437970609-dh92eoh64fns6jio1gisstlh18bneven.apps.googleusercontent.com.json
-autoposting-489119-64d5f54a634b.json
+# Google credentials (must stay local / in secret manager only)
+client_secret_*.json
+autoposting-*.json
+
