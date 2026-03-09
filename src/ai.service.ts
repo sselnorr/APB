@@ -1,9 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
-import { readFileSync, createReadStream } from 'node:fs';
+import { existsSync, readFileSync, createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 
@@ -19,7 +19,7 @@ export class AiService {
       throw new Error('OPENAI_API_KEY is required');
     }
     this.client = new OpenAI({ apiKey });
-    const promptPath = config.get<string>('SYSTEM_PROMPT_PATH') ?? 'system-prompt.md';
+    const promptPath = this.resolveSystemPromptPath(config.get<string>('SYSTEM_PROMPT_PATH'));
     this.systemPrompt = readFileSync(promptPath, 'utf8');
   }
 
@@ -99,5 +99,27 @@ export class AiService {
         reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
       });
     });
+  }
+
+  private resolveSystemPromptPath(configuredPath: string | undefined): string {
+    if (configuredPath?.trim()) {
+      return configuredPath.trim();
+    }
+
+    const candidates = [
+      resolve(__dirname, 'assets', 'system-prompt.md'),
+      resolve(process.cwd(), 'dist', 'src', 'assets', 'system-prompt.md'),
+      resolve(process.cwd(), 'src', 'assets', 'system-prompt.md'),
+      resolve(process.cwd(), 'system-prompt.md'),
+    ];
+
+    const found = candidates.find((candidate) => existsSync(candidate));
+    if (found) {
+      return found;
+    }
+
+    throw new Error(
+      `SYSTEM_PROMPT_PATH is not set and default prompt file was not found. Checked: ${candidates.join(', ')}`,
+    );
   }
 }
