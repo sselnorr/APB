@@ -59,10 +59,18 @@ GOOGLE_DRIVE_CLIENT_ID=...
 GOOGLE_DRIVE_CLIENT_SECRET=...
 GOOGLE_DRIVE_REFRESH_TOKEN=...
 
-# Option C (service account): set one of these
+# Option C (service account): use one of these
 GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH=autoposting-489119-64d5f54a634b.json
-# or raw JSON content:
+# or raw JSON content in a variable:
 # GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON={"type":"service_account",...}
+# or the same JSON encoded as base64:
+# GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64=eyJ0eXBlIjoic2VydmljZV9hY2NvdW50IiwuLi59
+
+# Optional alternative: instead of GOOGLE_DRIVE_CLIENT_ID / SECRET,
+# you can pass the full OAuth client JSON file contents:
+# GOOGLE_DRIVE_OAUTH_CLIENT_JSON={"installed":{"client_id":"...","client_secret":"..."}}
+# or base64:
+# GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64=eyJpbnN0YWxsZWQiOnsiY2xpZW50X2lkIjoiLi4uIn19
 
 # Optional: only read videos from this folder
 GOOGLE_DRIVE_FOLDER_ID=your_folder_id
@@ -72,6 +80,38 @@ GOOGLE_DRIVE_DOWNLOAD_DIR=downloads/videos
 ```
 
 If you use Service Account, share the target Google Drive folder/files with the service account email (`client_email` from the key JSON).
+
+## Railway deploy
+
+This repository contains a production `Dockerfile`, so Railway will use Docker instead of Railpack auto-detection. That avoids mismatches between build-time and runtime commands and makes deploys deterministic.
+
+Set these Railway variables:
+
+```bash
+PORT=4200
+GOOGLE_DRIVE_FOLDER_ID=...
+GOOGLE_DRIVE_RESULT_FOLDER_ID=...
+GOOGLE_DRIVE_SENT_FOLDER_ID=...
+GOOGLE_DRIVE_CLIENT_ID=...
+GOOGLE_DRIVE_CLIENT_SECRET=...
+GOOGLE_DRIVE_REFRESH_TOKEN=...
+# preferred for the service account on Railway:
+GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON=...or...
+GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_TARGET_CHAT_ID=...
+OPENAI_API_KEY=...
+UPLOAD_POST_API_KEY=...
+UPLOAD_POST_USERNAME=...
+```
+
+`client_secret_*.json` does not need to be committed to GitHub. You can either:
+
+- extract `client_id` and `client_secret` from that JSON and store them as Railway variables;
+- or paste the full file content into `GOOGLE_DRIVE_OAUTH_CLIENT_JSON`;
+- or store the file as base64 in `GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64`.
+
+The service account key should also stay out of Git. Use `GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON` or `GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64` in Railway instead of committing the `.json` file.
 
 ## Run tests
 

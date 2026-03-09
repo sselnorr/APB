@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+dist
+coverage
+logs
+data
+downloads
+.env
+.env.*
+client_secret_*.json
+autoposting-*.json
+*.log

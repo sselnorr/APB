@@ -8,7 +8,7 @@
   "scripts": {
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "start": "nest start",
+    "start": "node dist/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main.js",
@@ -24,7 +24,6 @@
     "@nestjs/config": "^4.0.3",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
-    "@nestjs/schedule": "^3.0.3",
     "form-data": "^4.0.0",
     "google-auth-library": "^10.6.1",
     "googleapis": "^140.0.0",

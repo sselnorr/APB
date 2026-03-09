@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { google, drive_v3 } from 'googleapis';
+import { createPrivateKey, createSign } from 'node:crypto';
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { v4 as uuid } from 'uuid';
@@ -17,6 +18,8 @@ export class GoogleDriveService {
   private readonly logger = new Logger(GoogleDriveService.name);
   private oauthDrive?: drive_v3.Drive;
   private serviceDrive?: drive_v3.Drive;
+  private serviceDriveInit?: Promise<drive_v3.Drive | undefined>;
+  private serviceAccountDisabledReason?: string;
   private readonly folderId: string;
   private readonly resultFolderId: string;
   private readonly sentFolderId: string;
@@ -26,8 +29,11 @@ export class GoogleDriveService {
   private readonly clientId?: string;
   private readonly clientSecret?: string;
   private readonly refreshToken?: string;
+  private readonly oauthClientJson?: string;
+  private readonly oauthClientJsonBase64?: string;
   private readonly serviceAccountKeyPath?: string;
   private readonly serviceAccountKeyJson?: string;
+  private readonly serviceAccountKeyJsonBase64?: string;
   private readonly sourceByFileId = new Map<string, 'oauth' | 'service'>();
 
   constructor(private readonly config: ConfigService) {
@@ -40,8 +46,13 @@ export class GoogleDriveService {
     this.clientId = this.clean(this.config.get<string>('GOOGLE_DRIVE_CLIENT_ID'));
     this.clientSecret = this.clean(this.config.get<string>('GOOGLE_DRIVE_CLIENT_SECRET'));
     this.refreshToken = this.clean(this.config.get<string>('GOOGLE_DRIVE_REFRESH_TOKEN'));
+    this.oauthClientJson = this.clean(this.config.get<string>('GOOGLE_DRIVE_OAUTH_CLIENT_JSON'));
+    this.oauthClientJsonBase64 = this.clean(this.config.get<string>('GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64'));
     this.serviceAccountKeyPath = this.clean(this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH'));
     this.serviceAccountKeyJson = this.clean(this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON'));
+    this.serviceAccountKeyJsonBase64 = this.clean(
+      this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64'),
+    );
   }
 
   async listIngestVideosOldestFirst(): Promise<DriveFileInfo[]> {
@@ -59,6 +70,7 @@ export class GoogleDriveService {
           this.sourceByFileId.set(file.id, client.kind);
         }
       } catch (err) {
+        this.handleDriveClientFailure(client.kind, err);
         this.logger.warn(`INGEST scan failed via ${client.kind}: ${err}`);
       }
     }
@@ -100,6 +112,7 @@ export class GoogleDriveService {
         this.sourceByFileId.set(fileId, client.kind);
         return targetPath;
       } catch (err) {
+        this.handleDriveClientFailure(client.kind, err);
         this.logger.warn(`Download failed via ${client.kind} for ${fileId}: ${err}`);
       }
     }
@@ -157,6 +170,7 @@ export class GoogleDriveService {
           return file.webContentLink;
         }
       } catch (err) {
+        this.handleDriveClientFailure(client.kind, err);
         this.logger.warn(`Cannot get webContentLink via ${client.kind} for ${fileId}: ${err}`);
       }
     }
@@ -184,6 +198,7 @@ export class GoogleDriveService {
         this.logger.log(`Moved INGEST file via ${client.kind}: ${fileId}`);
         return { id: fileId, link: this.fileLink(fileId) };
       } catch (err) {
+        this.handleDriveClientFailure(client.kind, err);
         this.logger.warn(`Direct move failed via ${client.kind} for ${fileId}: ${err}`);
       }
     }
@@ -278,6 +293,7 @@ export class GoogleDriveService {
           this.sourceByFileId.set(file.id, client.kind);
         }
       } catch (err) {
+        this.handleDriveClientFailure(client.kind, err);
         this.logger.warn(`Folder scan failed via ${client.kind} for ${folderId}: ${err}`);
       }
     }
@@ -289,11 +305,15 @@ export class GoogleDriveService {
     if (this.oauthDrive) {
       return this.oauthDrive;
     }
-    if (!this.clientId || !this.clientSecret || !this.refreshToken) {
+    const oauthClient = this.readOAuthClientCredentials();
+    const clientId = this.clientId ?? oauthClient?.clientId;
+    const clientSecret = this.clientSecret ?? oauthClient?.clientSecret;
+
+    if (!clientId || !clientSecret || !this.refreshToken) {
       throw new Error('Google Drive OAuth credentials are missing.');
     }
 
-    const oauth2 = new google.auth.OAuth2(this.clientId, this.clientSecret);
+    const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
     oauth2.setCredentials({
       refresh_token: this.refreshToken,
       access_token: this.accessToken,
@@ -317,18 +337,18 @@ export class GoogleDriveService {
     if (this.serviceDrive) {
       return this.serviceDrive;
     }
-    if (!this.serviceAccountKeyJson && !this.serviceAccountKeyPath) {
+    if (this.serviceDriveInit) {
+      return this.serviceDriveInit;
+    }
+    if (this.serviceAccountDisabledReason) {
+      return undefined;
+    }
+    if (!this.serviceAccountKeyJson && !this.serviceAccountKeyJsonBase64 && !this.serviceAccountKeyPath) {
       return undefined;
     }
 
-    const scopes = ['https://www.googleapis.com/auth/drive'];
-    const credentials = this.serviceAccountKeyJson
-      ? JSON.parse(this.serviceAccountKeyJson)
-      : JSON.parse(await fs.readFile(this.serviceAccountKeyPath as string, 'utf8'));
-    const auth = new google.auth.GoogleAuth({ credentials, scopes });
-    this.serviceDrive = google.drive({ version: 'v3', auth });
-    this.logger.warn('Using Google Drive service account credentials for INGEST fallback');
-    return this.serviceDrive;
+    this.serviceDriveInit = this.createServiceDrive();
+    return this.serviceDriveInit;
   }
 
   private async getIngestClients(): Promise<Array<{ kind: 'oauth' | 'service'; drive: drive_v3.Drive }>> {
@@ -420,6 +440,150 @@ export class GoogleDriveService {
     }
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  private readOAuthClientCredentials(): { clientId: string; clientSecret: string } | undefined {
+    const raw = this.oauthClientJson ?? this.decodeBase64(this.oauthClientJsonBase64);
+    if (!raw) {
+      return undefined;
+    }
+
+    const parsed = JSON.parse(raw) as {
+      installed?: { client_id?: string; client_secret?: string };
+      web?: { client_id?: string; client_secret?: string };
+    };
+    const client = parsed.installed ?? parsed.web;
+    if (!client?.client_id || !client.client_secret) {
+      throw new Error('Google OAuth client JSON must include client_id and client_secret.');
+    }
+
+    return {
+      clientId: client.client_id,
+      clientSecret: client.client_secret,
+    };
+  }
+
+  private async readServiceAccountCredentials(): Promise<Record<string, unknown>> {
+    const raw =
+      this.serviceAccountKeyJson ??
+      this.decodeBase64(this.serviceAccountKeyJsonBase64) ??
+      (this.serviceAccountKeyPath ? await fs.readFile(this.serviceAccountKeyPath, 'utf8') : undefined);
+
+    if (!raw) {
+      throw new Error('Google service account credentials are missing.');
+    }
+
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const privateKey = typeof parsed.private_key === 'string' ? this.normalizePrivateKey(parsed.private_key) : undefined;
+    const clientEmail = typeof parsed.client_email === 'string' ? parsed.client_email.trim() : undefined;
+
+    if (!privateKey) {
+      throw new Error('Google service account JSON must include private_key.');
+    }
+    if (!clientEmail) {
+      throw new Error('Google service account JSON must include client_email.');
+    }
+
+    this.assertServiceAccountPrivateKey(privateKey);
+
+    return {
+      ...parsed,
+      private_key: privateKey,
+      client_email: clientEmail,
+    };
+  }
+
+  private decodeBase64(value: string | undefined): string | undefined {
+    if (!value) {
+      return undefined;
+    }
+    return Buffer.from(value, 'base64').toString('utf8');
+  }
+
+  private async createServiceDrive(): Promise<drive_v3.Drive | undefined> {
+    try {
+      const scopes = ['https://www.googleapis.com/auth/drive'];
+      const credentials = await this.readServiceAccountCredentials();
+      const auth = new google.auth.GoogleAuth({ credentials, scopes });
+
+      await auth.getClient();
+
+      this.serviceDrive = google.drive({ version: 'v3', auth });
+      this.logger.warn('Using Google Drive service account credentials for INGEST fallback');
+      return this.serviceDrive;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.disableServiceAccountFallback(message);
+      return undefined;
+    }
+  }
+
+  private normalizePrivateKey(value: string): string {
+    return value
+      .trim()
+      .replace(/^"|"$/g, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\\n/g, '\n');
+  }
+
+  private assertServiceAccountPrivateKey(privateKey: string): void {
+    try {
+      const keyObject = createPrivateKey({ key: privateKey, format: 'pem' });
+      const sign = createSign('RSA-SHA256');
+      sign.update('google-drive-service-account-validation');
+      sign.end();
+      sign.sign(keyObject);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid service account private_key format: ${message}`);
+    }
+  }
+
+  private handleDriveClientFailure(kind: 'oauth' | 'service', err: unknown): void {
+    if (kind !== 'service') {
+      return;
+    }
+
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.looksLikeServiceAccountKeyError(message)) {
+      this.disableServiceAccountFallback(message);
+    }
+  }
+
+  private disableServiceAccountFallback(reason: string): void {
+    if (this.serviceAccountDisabledReason) {
+      return;
+    }
+
+    this.serviceAccountDisabledReason = reason;
+    this.serviceDrive = undefined;
+    this.serviceDriveInit = Promise.resolve(undefined);
+
+    if (this.hasOAuthCredentialsConfigured()) {
+      this.logger.debug(`Service account fallback disabled: ${reason}`);
+      return;
+    }
+
+    this.logger.warn(`Service account fallback disabled: ${reason}`);
+  }
+
+  private looksLikeServiceAccountKeyError(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes('decoder routines') ||
+      normalized.includes('pem routines') ||
+      normalized.includes('asn1') ||
+      normalized.includes('private key') ||
+      normalized.includes('invalid_grant')
+    );
+  }
+
+  private hasOAuthCredentialsConfigured(): boolean {
+    const oauthClient = this.readOAuthClientCredentials();
+    const clientId = this.clientId ?? oauthClient?.clientId;
+    const clientSecret = this.clientSecret ?? oauthClient?.clientSecret;
+
+    return Boolean(clientId && clientSecret && this.refreshToken);
   }
 
   private looksLikeVideo(name: string, mimeType: string): boolean {
