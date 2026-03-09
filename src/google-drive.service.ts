@@ -35,6 +35,7 @@ export class GoogleDriveService {
   private readonly serviceAccountKeyJson?: string;
   private readonly serviceAccountKeyJsonBase64?: string;
   private readonly sourceByFileId = new Map<string, 'oauth' | 'service'>();
+  private readonly folderDriveIdCache = new Map<string, string | null>();
 
   constructor(private readonly config: ConfigService) {
     this.folderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_FOLDER_ID')) ?? '';
@@ -253,6 +254,7 @@ export class GoogleDriveService {
     if (!folderId) {
       return [];
     }
+    const driveId = await this.getFolderDriveId(drive, folderId);
     const res = await drive.files.list({
       q: `'${folderId}' in parents and trashed = false`,
       fields: 'files(id,name,mimeType,createdTime)',
@@ -260,6 +262,8 @@ export class GoogleDriveService {
       includeItemsFromAllDrives: true,
       supportsAllDrives: true,
       orderBy: 'createdTime asc',
+      corpora: driveId ? 'drive' : 'allDrives',
+      driveId: driveId ?? undefined,
     });
 
     const files = res.data.files ?? [];
@@ -277,6 +281,26 @@ export class GoogleDriveService {
         mimeType: file.mimeType ?? '',
         createdTime: file.createdTime ?? '',
       }));
+  }
+
+  private async getFolderDriveId(drive: drive_v3.Drive, folderId: string): Promise<string | null> {
+    if (this.folderDriveIdCache.has(folderId)) {
+      return this.folderDriveIdCache.get(folderId) ?? null;
+    }
+
+    try {
+      const meta = await drive.files.get({
+        fileId: folderId,
+        fields: 'id,driveId',
+        supportsAllDrives: true,
+      });
+      const driveId = meta.data.driveId ?? null;
+      this.folderDriveIdCache.set(folderId, driveId);
+      return driveId;
+    } catch {
+      this.folderDriveIdCache.set(folderId, null);
+      return null;
+    }
   }
 
   private async listFolderFilesMerged(folderId: string, kind: 'video' | 'text'): Promise<DriveFileInfo[]> {
