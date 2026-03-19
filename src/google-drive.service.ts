@@ -1,103 +1,55 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { google, drive_v3 } from 'googleapis';
 import { createPrivateKey, createSign } from 'node:crypto';
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
+import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { v4 as uuid } from 'uuid';
+import { AppConfigService } from './app.config';
+import { DriveAssetInfo, DriveAssetStore, DriveFolderKey } from './domain/interfaces';
 
-export interface DriveFileInfo {
-  id: string;
-  name: string;
-  mimeType: string;
-  createdTime: string;
-}
+type DriveClientKind = 'oauth' | 'service';
 
 @Injectable()
-export class GoogleDriveService {
+export class GoogleDriveService implements DriveAssetStore {
   private readonly logger = new Logger(GoogleDriveService.name);
   private oauthDrive?: drive_v3.Drive;
   private serviceDrive?: drive_v3.Drive;
   private serviceDriveInit?: Promise<drive_v3.Drive | undefined>;
   private serviceAccountDisabledReason?: string;
-  private readonly folderId: string;
-  private readonly resultFolderId: string;
-  private readonly sentFolderId: string;
-  private readonly downloadDir: string;
-
-  private readonly accessToken?: string;
-  private readonly clientId?: string;
-  private readonly clientSecret?: string;
-  private readonly refreshToken?: string;
-  private readonly oauthClientJson?: string;
-  private readonly oauthClientJsonBase64?: string;
-  private readonly serviceAccountKeyPath?: string;
-  private readonly serviceAccountKeyJson?: string;
-  private readonly serviceAccountKeyJsonBase64?: string;
-  private readonly sourceByFileId = new Map<string, 'oauth' | 'service'>();
+  private readonly sourceByFileId = new Map<string, DriveClientKind>();
   private readonly folderMetaCache = new Map<string, { id: string; driveId: string | null }>();
-  private oauthScopesLogged = false;
 
-  constructor(private readonly config: ConfigService) {
-    this.folderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_FOLDER_ID')) ?? '';
-    this.resultFolderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_RESULT_FOLDER_ID')) ?? '';
-    this.sentFolderId = this.clean(this.config.get<string>('GOOGLE_DRIVE_SENT_FOLDER_ID')) ?? '';
-    this.downloadDir = this.clean(this.config.get<string>('GOOGLE_DRIVE_DOWNLOAD_DIR')) ?? 'downloads/videos';
+  constructor(private readonly appConfig: AppConfigService) {}
 
-    this.accessToken = this.clean(this.config.get<string>('GOOGLE_DRIVE_ACCESS_TOKEN'));
-    this.clientId = this.clean(this.config.get<string>('GOOGLE_DRIVE_CLIENT_ID'));
-    this.clientSecret = this.clean(this.config.get<string>('GOOGLE_DRIVE_CLIENT_SECRET'));
-    this.refreshToken = this.clean(this.config.get<string>('GOOGLE_DRIVE_REFRESH_TOKEN'));
-    this.oauthClientJson = this.clean(this.config.get<string>('GOOGLE_DRIVE_OAUTH_CLIENT_JSON'));
-    this.oauthClientJsonBase64 = this.clean(this.config.get<string>('GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64'));
-    this.serviceAccountKeyPath = this.clean(this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH'));
-    this.serviceAccountKeyJson = this.clean(this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON'));
-    this.serviceAccountKeyJsonBase64 = this.clean(
-      this.config.get<string>('GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64'),
-    );
+  async listIngestVideosOldestFirst(): Promise<DriveAssetInfo[]> {
+    return this.listFolderFilesMerged(this.appConfig.ingestFolderId, 'video');
   }
 
-  async listIngestVideosOldestFirst(): Promise<DriveFileInfo[]> {
-    if (!this.folderId) {
-      return [];
-    }
-
-    const merged = new Map<string, DriveFileInfo>();
-    for (const client of await this.getIngestClients()) {
-      try {
-        const files = await this.listFolderFilesByDrive(client.drive, this.folderId, 'video');
-        this.logger.log(`INGEST scan via ${client.kind}: ${files.length} video(s)`);
-        for (const file of files) {
-          merged.set(file.id, file);
-          this.sourceByFileId.set(file.id, client.kind);
-        }
-      } catch (err) {
-        this.handleDriveClientFailure(client.kind, err);
-        this.logger.warn(`INGEST scan failed via ${client.kind}: ${err}`);
-      }
-    }
-
-    return Array.from(merged.values()).sort((a, b) => a.createdTime.localeCompare(b.createdTime));
+  async listRecentFiles(folder: DriveFolderKey, limit: number): Promise<DriveAssetInfo[]> {
+    const folderId = this.getFolderId(folder);
+    const files = await this.listFolderFilesMerged(folderId, 'any');
+    return files.slice(-limit).reverse();
   }
 
-  async listResultVideos(): Promise<DriveFileInfo[]> {
-    return this.listFolderFilesMerged(this.resultFolderId, 'video');
+  async listRecentVideos(folder: DriveFolderKey, limit: number): Promise<DriveAssetInfo[]> {
+    const folderId = this.getFolderId(folder);
+    const files = await this.listFolderFilesMerged(folderId, 'video');
+    return files.slice(-limit).reverse();
   }
 
-  async listSentVideos(): Promise<DriveFileInfo[]> {
-    return this.listFolderFilesMerged(this.sentFolderId, 'video');
-  }
-
-  async listResultTextFiles(): Promise<DriveFileInfo[]> {
-    return this.listFolderFilesMerged(this.resultFolderId, 'text');
+  async listRecentTextFiles(folder: DriveFolderKey, limit: number): Promise<DriveAssetInfo[]> {
+    const folderId = this.getFolderId(folder);
+    const files = await this.listFolderFilesMerged(folderId, 'text');
+    return files.slice(-limit).reverse();
   }
 
   async downloadFile(fileId: string, nameHint?: string): Promise<string> {
-    await fs.mkdir(this.downloadDir, { recursive: true });
+    await fs.mkdir(this.appConfig.downloadDir, { recursive: true });
     const safeName = nameHint ?? `${fileId}-${uuid()}.bin`;
-    const targetPath = join(this.downloadDir, safeName);
+    const targetPath = join(this.appConfig.downloadDir, safeName);
 
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
+    for (const client of await this.getClientsByPriority(fileId)) {
       try {
         const response = await client.drive.files.get(
           { fileId, alt: 'media', supportsAllDrives: true },
@@ -113,49 +65,98 @@ export class GoogleDriveService {
         });
         this.sourceByFileId.set(fileId, client.kind);
         return targetPath;
-      } catch (err) {
-        this.handleDriveClientFailure(client.kind, err);
-        this.logger.warn(`Download failed via ${client.kind} for ${fileId}: ${err}`);
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
+        this.logger.warn(`Download failed via ${client.kind} for ${fileId}: ${error}`);
       }
     }
 
-    throw new Error(`Cannot download file ${fileId} from available Drive clients.`);
-  }
-
-  async uploadTextFile(name: string, content: string): Promise<{ id: string; link: string }> {
-    const drive = await this.getOAuthDrive();
-    const resultParentId = this.resultFolderId ? await this.resolveFolderId(drive, this.resultFolderId) : undefined;
-    const res = await drive.files.create({
-      requestBody: {
-        name,
-        parents: resultParentId ? [resultParentId] : undefined,
-        mimeType: 'text/plain',
-      },
-      media: { mimeType: 'text/plain', body: content },
-      fields: 'id',
-      supportsAllDrives: true,
-    });
-
-    const id = res.data.id;
-    if (!id) {
-      throw new Error('Drive did not return id for text file upload');
-    }
-    return { id, link: this.fileLink(id) };
+    throw new Error(`Cannot download file ${fileId} from Google Drive`);
   }
 
   async readTextFile(fileId: string): Promise<string> {
-    const drive = await this.getOAuthDrive();
-    const response = await drive.files.get(
-      { fileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'text' },
+    for (const client of await this.getClientsByPriority(fileId)) {
+      try {
+        const response = await client.drive.files.get(
+          { fileId, alt: 'media', supportsAllDrives: true },
+          { responseType: 'text' },
+        );
+        return String(response.data ?? '');
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
+      }
+    }
+
+    throw new Error(`Cannot read text file ${fileId}`);
+  }
+
+  async upsertIngestDescription(videoName: string, content: string): Promise<DriveAssetInfo> {
+    return this.upsertTextFileByName('ingest', `${this.stripExtension(videoName)}.txt`, content);
+  }
+
+  async upsertTelegramDraftText(stem: string, content: string, existingFileId?: string): Promise<DriveAssetInfo> {
+    return this.upsertTextFile('tgDrafts', `${stem}.txt`, content, existingFileId);
+  }
+
+  async upsertWrittenText(stem: string, content: string, existingFileId?: string): Promise<DriveAssetInfo> {
+    return this.upsertTextFile('written', `${stem}.txt`, content, existingFileId);
+  }
+
+  async uploadTelegramDraftImage(
+    stem: string,
+    bytes: Buffer,
+    mimeType: string,
+    existingFileId?: string,
+  ): Promise<DriveAssetInfo> {
+    return this.upsertBinaryFile('tgDrafts', `${stem}${this.extensionByMime(mimeType)}`, bytes, mimeType, existingFileId);
+  }
+
+  async uploadWrittenImage(
+    stem: string,
+    bytes: Buffer,
+    mimeType: string,
+    existingFileId?: string,
+  ): Promise<DriveAssetInfo> {
+    return this.upsertBinaryFile('written', `${stem}${this.extensionByMime(mimeType)}`, bytes, mimeType, existingFileId);
+  }
+
+  async moveIngestAssetsToSent(videoFileId: string, textFileId: string): Promise<void> {
+    await this.moveFileBetweenFoldersAnyClient(videoFileId, this.appConfig.ingestFolderId, this.appConfig.sentFolderId);
+    await this.moveFileBetweenFoldersAnyClient(textFileId, this.appConfig.ingestFolderId, this.appConfig.sentFolderId);
+  }
+
+  async moveWrittenAssetsToPublished(textFileId: string, imageFileId?: string | null): Promise<void> {
+    await this.moveFileBetweenFoldersAnyClient(
+      textFileId,
+      this.appConfig.writtenFolderId,
+      this.appConfig.publishedFolderId,
     );
-    return String(response.data ?? '');
+    if (imageFileId) {
+      await this.moveFileBetweenFoldersAnyClient(
+        imageFileId,
+        this.appConfig.writtenFolderId,
+        this.appConfig.publishedFolderId,
+      );
+    }
+  }
+
+  async deleteFile(fileId: string): Promise<void> {
+    for (const client of await this.getClientsByPriority(fileId)) {
+      try {
+        await client.drive.files.delete({ fileId, supportsAllDrives: true });
+        return;
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
+      }
+    }
+
+    throw new Error(`Cannot delete file ${fileId}`);
   }
 
   async getPublicVideoDownloadUrl(fileId: string): Promise<string> {
     await this.makePublic(fileId);
 
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
+    for (const client of await this.getClientsByPriority(fileId)) {
       try {
         const meta = await client.drive.files.get({
           fileId,
@@ -166,147 +167,234 @@ export class GoogleDriveService {
         if (!file.id) {
           continue;
         }
-        if (!this.looksLikeVideo(file.name ?? '', file.mimeType ?? '')) {
-          throw new Error(`File is not video: ${file.name ?? fileId}`);
-        }
         if (file.webContentLink) {
           return file.webContentLink;
         }
-      } catch (err) {
-        this.handleDriveClientFailure(client.kind, err);
-        this.logger.warn(`Cannot get webContentLink via ${client.kind} for ${fileId}: ${err}`);
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
       }
     }
 
     return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
   }
 
-  async deleteFile(fileId: string): Promise<void> {
-    const drive = await this.getOAuthDrive();
-    await drive.files.delete({ fileId, supportsAllDrives: true });
+  async findSiblingTextInIngest(videoName: string): Promise<DriveAssetInfo | null> {
+    const targetName = `${this.stripExtension(videoName)}.txt`;
+    return this.findFileByName(this.appConfig.ingestFolderId, targetName);
   }
 
-  async moveIngestVideoToResult(
-    fileId: string,
-    localVideoPath: string,
-    originalName: string,
-  ): Promise<{ id: string; link: string }> {
-    if (!this.folderId || !this.resultFolderId) {
-      throw new Error('GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_RESULT_FOLDER_ID are required.');
+  private async upsertTextFile(
+    folder: DriveFolderKey,
+    fileName: string,
+    content: string,
+    existingFileId?: string,
+  ): Promise<DriveAssetInfo> {
+    const folderId = this.getFolderId(folder);
+
+    if (existingFileId) {
+      return this.updateExistingFile(existingFileId, fileName, 'text/plain', () => Readable.from([content]));
     }
 
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
+    const existing = await this.findFileByName(folderId, fileName);
+    if (existing) {
+      return this.updateExistingFile(existing.id, fileName, 'text/plain', () => Readable.from([content]));
+    }
+
+    return this.createFile(folderId, fileName, 'text/plain', () => Readable.from([content]));
+  }
+
+  private async upsertTextFileByName(folder: DriveFolderKey, fileName: string, content: string): Promise<DriveAssetInfo> {
+    return this.upsertTextFile(folder, fileName, content);
+  }
+
+  private async upsertBinaryFile(
+    folder: DriveFolderKey,
+    fileName: string,
+    bytes: Buffer,
+    mimeType: string,
+    existingFileId?: string,
+  ): Promise<DriveAssetInfo> {
+    const folderId = this.getFolderId(folder);
+
+    if (existingFileId) {
+      return this.updateExistingFile(existingFileId, fileName, mimeType, () => Readable.from(bytes));
+    }
+
+    const existing = await this.findFileByName(folderId, fileName);
+    if (existing) {
+      return this.updateExistingFile(existing.id, fileName, mimeType, () => Readable.from(bytes));
+    }
+
+    return this.createFile(folderId, fileName, mimeType, () => Readable.from(bytes));
+  }
+
+  private async createFile(
+    folderId: string,
+    fileName: string,
+    mimeType: string,
+    bodyFactory: () => Readable,
+  ): Promise<DriveAssetInfo> {
+    let lastError = 'unknown';
+    for (const client of await this.getDriveClients()) {
       try {
-        const fromFolderId = await this.resolveFolderId(client.drive, this.folderId);
-        const toFolderId = await this.resolveFolderId(client.drive, this.resultFolderId);
-        await this.moveFileBetweenFolders(client.drive, fileId, fromFolderId, toFolderId);
-        this.logger.log(`Moved INGEST file via ${client.kind}: ${fileId}`);
-        return { id: fileId, link: this.fileLink(fileId) };
-      } catch (err) {
-        this.handleDriveClientFailure(client.kind, err);
-        this.logger.warn(`Direct move failed via ${client.kind} for ${fileId}: ${err}`);
+        const parentId = await this.resolveFolderId(client.drive, folderId);
+        const response = await client.drive.files.create({
+          requestBody: {
+            name: fileName,
+            parents: [parentId],
+            mimeType,
+          },
+          media: { mimeType, body: bodyFactory() },
+          fields: 'id,name,mimeType,createdTime',
+          supportsAllDrives: true,
+        });
+        const created = response.data;
+        if (!created.id || !created.name) {
+          throw new Error('Drive create returned empty id');
+        }
+        return {
+          id: created.id,
+          name: created.name,
+          mimeType: created.mimeType ?? mimeType,
+          createdTime: created.createdTime ?? new Date().toISOString(),
+        };
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        this.handleDriveClientFailure(client.kind, error);
       }
     }
 
-    const oauth = await this.getOAuthDrive();
-    const resultParentId = await this.resolveFolderId(oauth, this.resultFolderId);
-    const uploaded = await oauth.files.create({
-      requestBody: {
-        name: originalName,
-        parents: [resultParentId],
-        mimeType: this.videoMimeByName(originalName),
-      },
-      media: {
-        mimeType: this.videoMimeByName(originalName),
-        body: createReadStream(localVideoPath),
-      },
-      fields: 'id',
-      supportsAllDrives: true,
-    });
-
-    const newId = uploaded.data.id;
-    if (!newId) {
-      throw new Error('Fallback upload to RESULT returned empty file id.');
-    }
-
-    try {
-      await this.deleteSourceFromIngest(fileId);
-      this.logger.log(`Fallback move completed with reupload: ${fileId} -> ${newId}`);
-      return { id: newId, link: this.fileLink(newId) };
-    } catch (err) {
-      await oauth.files.delete({ fileId: newId, supportsAllDrives: true }).catch(() => undefined);
-      throw err;
-    }
+    throw new Error(`Cannot create file ${fileName}: ${lastError}`);
   }
 
-  async moveResultAssetsToSent(videoFileId: string, txtFileId: string): Promise<void> {
-    if (!this.resultFolderId || !this.sentFolderId) {
-      throw new Error('GOOGLE_DRIVE_RESULT_FOLDER_ID and GOOGLE_DRIVE_SENT_FOLDER_ID are required.');
+  private async updateExistingFile(
+    fileId: string,
+    fileName: string,
+    mimeType: string,
+    bodyFactory: () => Readable,
+  ): Promise<DriveAssetInfo> {
+    let lastError = 'unknown';
+    for (const client of await this.getClientsByPriority(fileId)) {
+      try {
+        const response = await client.drive.files.update({
+          fileId,
+          requestBody: { name: fileName, mimeType },
+          media: { mimeType, body: bodyFactory() },
+          fields: 'id,name,mimeType,createdTime',
+          supportsAllDrives: true,
+        });
+        const updated = response.data;
+        if (!updated.id || !updated.name) {
+          throw new Error('Drive update returned empty id');
+        }
+        return {
+          id: updated.id,
+          name: updated.name,
+          mimeType: updated.mimeType ?? mimeType,
+          createdTime: updated.createdTime ?? new Date().toISOString(),
+        };
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        this.handleDriveClientFailure(client.kind, error);
+      }
     }
-    await this.moveFileBetweenFoldersAnyClient(videoFileId, this.resultFolderId, this.sentFolderId);
-    await this.moveFileBetweenFoldersAnyClient(txtFileId, this.resultFolderId, this.sentFolderId);
+
+    throw new Error(`Cannot update file ${fileName}: ${lastError}`);
   }
 
-  fileLink(fileId: string): string {
-    return `https://drive.google.com/file/d/${fileId}/view?usp=sharing`;
+  private async findFileByName(folderId: string, fileName: string): Promise<DriveAssetInfo | null> {
+    const escapedName = fileName.replace(/'/g, "\\'");
+    const targetFolderId = this.resolveRawFolderId(folderId);
+    for (const client of await this.getDriveClients()) {
+      try {
+        const folderTarget = await this.resolveFolderTarget(client.drive, targetFolderId);
+        const q = `'${folderTarget.id}' in parents and trashed = false and name = '${escapedName}'`;
+        const files = await this.listFilesPaged(client.drive, {
+          q,
+          fields: 'files(id,name,mimeType,createdTime)',
+          includeItemsFromAllDrives: true,
+          supportsAllDrives: true,
+          corpora: folderTarget.driveId ? 'drive' : 'allDrives',
+          driveId: folderTarget.driveId ?? undefined,
+          pageSize: 10,
+        });
+        const file = files[0];
+        if (file?.id && file.name) {
+          return {
+            id: file.id,
+            name: file.name,
+            mimeType: file.mimeType ?? '',
+            createdTime: file.createdTime ?? new Date().toISOString(),
+          };
+        }
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
+      }
+    }
+    return null;
+  }
+
+  private async moveFileBetweenFoldersAnyClient(fileId: string, fromFolderId: string, toFolderId: string): Promise<void> {
+    let lastError = 'unknown';
+    for (const client of await this.getClientsByPriority(fileId)) {
+      try {
+        const resolvedFrom = await this.resolveFolderId(client.drive, fromFolderId);
+        const resolvedTo = await this.resolveFolderId(client.drive, toFolderId);
+        await this.moveFileBetweenFolders(client.drive, fileId, resolvedFrom, resolvedTo);
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        this.handleDriveClientFailure(client.kind, error);
+      }
+    }
+
+    throw new Error(`Cannot move file ${fileId}: ${lastError}`);
+  }
+
+  private async listFolderFilesMerged(folderId: string, kind: 'video' | 'text' | 'any'): Promise<DriveAssetInfo[]> {
+    const merged = new Map<string, DriveAssetInfo>();
+    for (const client of await this.getDriveClients()) {
+      try {
+        const files = await this.listFolderFilesByDrive(client.drive, folderId, kind);
+        for (const file of files) {
+          merged.set(file.id, file);
+          this.sourceByFileId.set(file.id, client.kind);
+        }
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
+      }
+    }
+    return Array.from(merged.values()).sort((a, b) => a.createdTime.localeCompare(b.createdTime));
   }
 
   private async listFolderFilesByDrive(
     drive: drive_v3.Drive,
     folderId: string,
-    kind: 'video' | 'text',
-  ): Promise<DriveFileInfo[]> {
-    if (!folderId) {
-      return [];
-    }
+    kind: 'video' | 'text' | 'any',
+  ): Promise<DriveAssetInfo[]> {
     const target = await this.resolveFolderTarget(drive, folderId);
     const q = `'${target.id}' in parents and trashed = false`;
-    const attempts: Array<{ name: string; params: Partial<drive_v3.Params$Resource$Files$List> }> = [];
-    if (target.driveId) {
-      attempts.push({
-        name: 'drive',
-        params: { corpora: 'drive', driveId: target.driveId },
-      });
-    }
-    attempts.push({
-      name: 'allDrives',
-      params: { corpora: 'allDrives' },
-    });
-    attempts.push({
-      name: 'user',
-      params: { corpora: 'user' },
+    const files = await this.listFilesPaged(drive, {
+      q,
+      fields: 'nextPageToken,files(id,name,mimeType,createdTime)',
+      pageSize: 1000,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
+      orderBy: 'createdTime asc',
+      corpora: target.driveId ? 'drive' : 'allDrives',
+      driveId: target.driveId ?? undefined,
     });
 
-    const merged = new Map<string, drive_v3.Schema$File>();
-    for (const attempt of attempts) {
-      const files = await this.listFilesPaged(drive, {
-        q,
-        fields: 'nextPageToken,files(id,name,mimeType,createdTime)',
-        pageSize: 1000,
-        includeItemsFromAllDrives: true,
-        supportsAllDrives: true,
-        orderBy: 'createdTime asc',
-        ...attempt.params,
-      });
-      this.logger.debug(`Folder scan strategy=${attempt.name} folder=${target.id} files=${files.length}`);
-      for (const file of files) {
-        if (file.id) {
-          merged.set(file.id, file);
-        }
-      }
-      if (merged.size > 0) {
-        break;
-      }
-    }
-
-    const files = Array.from(merged.values());
     return files
       .filter((file) => Boolean(file.id && file.name))
       .filter((file) => {
         if (kind === 'video') {
           return this.looksLikeVideo(file.name as string, file.mimeType ?? '');
         }
-        return this.looksLikeText(file.name as string, file.mimeType ?? '');
+        if (kind === 'text') {
+          return this.looksLikeText(file.name as string, file.mimeType ?? '');
+        }
+        return true;
       })
       .map((file) => ({
         id: file.id as string,
@@ -316,200 +404,8 @@ export class GoogleDriveService {
       }));
   }
 
-  private async resolveFolderTarget(
-    drive: drive_v3.Drive,
-    folderId: string,
-  ): Promise<{ id: string; driveId: string | null }> {
-    if (this.folderMetaCache.has(folderId)) {
-      return this.folderMetaCache.get(folderId) as { id: string; driveId: string | null };
-    }
-
-    try {
-      const meta = await drive.files.get({
-        fileId: folderId,
-        fields: 'id,driveId,mimeType,shortcutDetails',
-        supportsAllDrives: true,
-      });
-
-      const mimeType = meta.data.mimeType ?? '';
-      if (
-        mimeType === 'application/vnd.google-apps.shortcut' &&
-        meta.data.shortcutDetails?.targetId &&
-        meta.data.shortcutDetails.targetMimeType === 'application/vnd.google-apps.folder'
-      ) {
-        const targetId = meta.data.shortcutDetails.targetId;
-        const targetMeta = await drive.files.get({
-          fileId: targetId,
-          fields: 'id,driveId',
-          supportsAllDrives: true,
-        });
-        const resolved = { id: targetId, driveId: targetMeta.data.driveId ?? null };
-        this.folderMetaCache.set(folderId, resolved);
-        return resolved;
-      }
-
-      const resolved = { id: folderId, driveId: meta.data.driveId ?? null };
-      this.folderMetaCache.set(folderId, resolved);
-      return resolved;
-    } catch {
-      const fallback = { id: folderId, driveId: null };
-      this.folderMetaCache.set(folderId, fallback);
-      return fallback;
-    }
-  }
-
-  private async listFilesPaged(
-    drive: drive_v3.Drive,
-    params: drive_v3.Params$Resource$Files$List,
-  ): Promise<drive_v3.Schema$File[]> {
-    const all: drive_v3.Schema$File[] = [];
-    let pageToken: string | undefined;
-    do {
-      const res = await drive.files.list({
-        ...params,
-        pageToken,
-      });
-      all.push(...(res.data.files ?? []));
-      pageToken = res.data.nextPageToken ?? undefined;
-    } while (pageToken);
-    return all;
-  }
-
-  private async resolveFolderId(drive: drive_v3.Drive, folderId: string): Promise<string> {
-    const target = await this.resolveFolderTarget(drive, folderId);
-    return target.id;
-  }
-
-  private async listFolderFilesMerged(folderId: string, kind: 'video' | 'text'): Promise<DriveFileInfo[]> {
-    if (!folderId) {
-      return [];
-    }
-
-    const merged = new Map<string, DriveFileInfo>();
-    for (const client of await this.getIngestClients()) {
-      try {
-        const files = await this.listFolderFilesByDrive(client.drive, folderId, kind);
-        for (const file of files) {
-          merged.set(file.id, file);
-          this.sourceByFileId.set(file.id, client.kind);
-        }
-      } catch (err) {
-        this.handleDriveClientFailure(client.kind, err);
-        this.logger.warn(`Folder scan failed via ${client.kind} for ${folderId}: ${err}`);
-      }
-    }
-
-    return Array.from(merged.values()).sort((a, b) => a.createdTime.localeCompare(b.createdTime));
-  }
-
-  private async getOAuthDrive(): Promise<drive_v3.Drive> {
-    if (this.oauthDrive) {
-      return this.oauthDrive;
-    }
-    const oauthClient = this.readOAuthClientCredentials();
-    const clientId = this.clientId ?? oauthClient?.clientId;
-    const clientSecret = this.clientSecret ?? oauthClient?.clientSecret;
-
-    if (!clientId || !clientSecret || !this.refreshToken) {
-      throw new Error('Google Drive OAuth credentials are missing.');
-    }
-
-    const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
-    oauth2.setCredentials({
-      refresh_token: this.refreshToken,
-      access_token: this.accessToken,
-    });
-
-    try {
-      const token = await oauth2.getAccessToken();
-      if (!token.token) {
-        throw new Error('OAuth refresh returned empty access token');
-      }
-      if (!this.oauthScopesLogged) {
-        try {
-          const tokenInfo = await oauth2.getTokenInfo(token.token);
-          const scopes = tokenInfo.scopes?.join(' ') || 'unknown';
-          this.logger.debug(`OAuth token scopes: ${scopes}`);
-          this.oauthScopesLogged = true;
-        } catch (scopeErr) {
-          this.logger.debug(`Cannot read OAuth token scopes: ${scopeErr}`);
-        }
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Google Drive OAuth initialization failed: ${message}`);
-    }
-
-    this.oauthDrive = google.drive({ version: 'v3', auth: oauth2 });
-    return this.oauthDrive;
-  }
-
-  private async getServiceDrive(): Promise<drive_v3.Drive | undefined> {
-    if (this.serviceDrive) {
-      return this.serviceDrive;
-    }
-    if (this.serviceDriveInit) {
-      return this.serviceDriveInit;
-    }
-    if (this.serviceAccountDisabledReason) {
-      return undefined;
-    }
-    if (!this.serviceAccountKeyJson && !this.serviceAccountKeyJsonBase64 && !this.serviceAccountKeyPath) {
-      return undefined;
-    }
-
-    this.serviceDriveInit = this.createServiceDrive();
-    return this.serviceDriveInit;
-  }
-
-  private async getIngestClients(): Promise<Array<{ kind: 'oauth' | 'service'; drive: drive_v3.Drive }>> {
-    const clients: Array<{ kind: 'oauth' | 'service'; drive: drive_v3.Drive }> = [];
-    const service = await this.getServiceDrive();
-    if (service) {
-      clients.push({ kind: 'service', drive: service });
-    }
-    try {
-      clients.push({ kind: 'oauth', drive: await this.getOAuthDrive() });
-    } catch (err) {
-      this.logger.warn(`OAuth client unavailable for INGEST: ${err}`);
-    }
-    if (!clients.length) {
-      throw new Error('No Drive client available for INGEST.');
-    }
-    return clients;
-  }
-
-  private async getIngestClientsByPriority(
-    fileId: string,
-  ): Promise<Array<{ kind: 'oauth' | 'service'; drive: drive_v3.Drive }>> {
-    const clients = await this.getIngestClients();
-    const preferred = this.sourceByFileId.get(fileId);
-    if (!preferred) {
-      return clients;
-    }
-    return clients.sort((a, b) => {
-      if (a.kind === preferred && b.kind !== preferred) return -1;
-      if (b.kind === preferred && a.kind !== preferred) return 1;
-      return 0;
-    });
-  }
-
-  private async deleteSourceFromIngest(fileId: string): Promise<void> {
-    let lastError: string | undefined;
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
-      try {
-        await client.drive.files.delete({ fileId, supportsAllDrives: true });
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
-        this.logger.warn(`Delete source failed via ${client.kind} for ${fileId}: ${lastError}`);
-      }
-    }
-    throw new Error(`Cannot delete source file ${fileId} from INGEST. Last error: ${lastError ?? 'unknown'}`);
-  }
-
   private async makePublic(fileId: string): Promise<void> {
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
+    for (const client of await this.getClientsByPriority(fileId)) {
       try {
         await client.drive.permissions.create({
           fileId,
@@ -517,239 +413,10 @@ export class GoogleDriveService {
           supportsAllDrives: true,
         });
         return;
-      } catch (err) {
-        this.logger.warn(`Failed to set public permission via ${client.kind} for ${fileId}: ${err}`);
+      } catch (error) {
+        this.handleDriveClientFailure(client.kind, error);
       }
     }
-  }
-
-  private async moveFileBetweenFoldersAnyClient(
-    fileId: string,
-    fromFolderId: string,
-    toFolderId: string,
-  ): Promise<void> {
-    let lastError: string | undefined;
-    for (const client of await this.getIngestClientsByPriority(fileId)) {
-      try {
-        const resolvedFrom = await this.resolveFolderId(client.drive, fromFolderId);
-        const resolvedTo = await this.resolveFolderId(client.drive, toFolderId);
-        await this.moveFileBetweenFolders(client.drive, fileId, resolvedFrom, resolvedTo);
-        this.logger.log(`Moved file ${fileId} via ${client.kind}: ${resolvedFrom} -> ${resolvedTo}`);
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
-        this.logger.warn(`Move failed via ${client.kind} for ${fileId}: ${lastError}`);
-      }
-    }
-
-    throw new Error(
-      `Cannot move file ${fileId} from ${fromFolderId} to ${toFolderId}. Last error: ${lastError ?? 'unknown'}`,
-    );
-  }
-
-  private clean(value: string | undefined): string | undefined {
-    if (!value) {
-      return undefined;
-    }
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  }
-
-  private readOAuthClientCredentials(): { clientId: string; clientSecret: string } | undefined {
-    const raw = this.oauthClientJson ?? this.decodeBase64(this.oauthClientJsonBase64);
-    if (!raw) {
-      return undefined;
-    }
-
-    const parsed = this.parseJsonObject(raw, 'Google OAuth client JSON') as {
-      installed?: { client_id?: string; client_secret?: string };
-      web?: { client_id?: string; client_secret?: string };
-    };
-    const client = parsed.installed ?? parsed.web;
-    if (!client?.client_id || !client.client_secret) {
-      throw new Error('Google OAuth client JSON must include client_id and client_secret.');
-    }
-
-    return {
-      clientId: client.client_id,
-      clientSecret: client.client_secret,
-    };
-  }
-
-  private async readServiceAccountCredentials(): Promise<Record<string, unknown>> {
-    const raw =
-      this.serviceAccountKeyJson ??
-      this.decodeBase64(this.serviceAccountKeyJsonBase64) ??
-      (this.serviceAccountKeyPath ? await fs.readFile(this.serviceAccountKeyPath, 'utf8') : undefined);
-
-    if (!raw) {
-      throw new Error('Google service account credentials are missing.');
-    }
-
-    const parsed = this.parseJsonObject(raw, 'Google service account JSON') as Record<string, unknown>;
-    const privateKey = typeof parsed.private_key === 'string' ? this.normalizePrivateKey(parsed.private_key) : undefined;
-    const clientEmail = typeof parsed.client_email === 'string' ? parsed.client_email.trim() : undefined;
-
-    if (!privateKey) {
-      throw new Error('Google service account JSON must include private_key.');
-    }
-    if (!clientEmail) {
-      throw new Error('Google service account JSON must include client_email.');
-    }
-
-    this.assertServiceAccountPrivateKey(privateKey);
-
-    return {
-      ...parsed,
-      private_key: privateKey,
-      client_email: clientEmail,
-    };
-  }
-
-  private decodeBase64(value: string | undefined): string | undefined {
-    if (!value) {
-      return undefined;
-    }
-    return Buffer.from(value, 'base64').toString('utf8');
-  }
-
-  private parseJsonObject(raw: string, label: string): unknown {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      const trimmed = raw.trim();
-      if (
-        (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
-        (trimmed.startsWith('"') && trimmed.endsWith('"'))
-      ) {
-        return JSON.parse(trimmed.slice(1, -1));
-      }
-      throw new Error(`${label} is not valid JSON.`);
-    }
-  }
-
-  private async createServiceDrive(): Promise<drive_v3.Drive | undefined> {
-    try {
-      const scopes = ['https://www.googleapis.com/auth/drive'];
-      const credentials = await this.readServiceAccountCredentials();
-      const auth = new google.auth.GoogleAuth({ credentials, scopes });
-
-      await auth.getClient();
-
-      this.serviceDrive = google.drive({ version: 'v3', auth });
-      this.logger.warn('Using Google Drive service account credentials for INGEST fallback');
-      return this.serviceDrive;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.disableServiceAccountFallback(message);
-      return undefined;
-    }
-  }
-
-  private normalizePrivateKey(value: string): string {
-    const normalized = value
-      .trim()
-      .replace(/^"|"$/g, '')
-      .replace(/^'|'$/g, '')
-      .replace(/\r\n/g, '\n')
-      .replace(/\\n/g, '\n');
-
-    const begin = '-----BEGIN PRIVATE KEY-----';
-    const end = '-----END PRIVATE KEY-----';
-    if (!normalized.includes(begin) || !normalized.includes(end)) {
-      return normalized;
-    }
-
-    const bodyRaw = normalized
-      .slice(normalized.indexOf(begin) + begin.length, normalized.indexOf(end))
-      .replace(/[\s\r\n]+/g, '');
-    const body = bodyRaw.match(/.{1,64}/g)?.join('\n') ?? bodyRaw;
-    return `${begin}\n${body}\n${end}`;
-  }
-
-  private assertServiceAccountPrivateKey(privateKey: string): void {
-    try {
-      const keyObject = createPrivateKey({ key: privateKey, format: 'pem' });
-      const sign = createSign('RSA-SHA256');
-      sign.update('google-drive-service-account-validation');
-      sign.end();
-      sign.sign(keyObject);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Invalid service account private_key format: ${message}`);
-    }
-  }
-
-  private handleDriveClientFailure(kind: 'oauth' | 'service', err: unknown): void {
-    if (kind !== 'service') {
-      return;
-    }
-
-    const message = err instanceof Error ? err.message : String(err);
-    if (this.looksLikeServiceAccountKeyError(message)) {
-      this.disableServiceAccountFallback(message);
-    }
-  }
-
-  private disableServiceAccountFallback(reason: string): void {
-    if (this.serviceAccountDisabledReason) {
-      return;
-    }
-
-    this.serviceAccountDisabledReason = reason;
-    this.serviceDrive = undefined;
-    this.serviceDriveInit = Promise.resolve(undefined);
-
-    if (this.hasOAuthCredentialsConfigured()) {
-      this.logger.debug(`Service account fallback disabled: ${reason}`);
-      return;
-    }
-
-    this.logger.warn(`Service account fallback disabled: ${reason}`);
-  }
-
-  private looksLikeServiceAccountKeyError(message: string): boolean {
-    const normalized = message.toLowerCase();
-    return (
-      normalized.includes('decoder routines') ||
-      normalized.includes('pem routines') ||
-      normalized.includes('asn1') ||
-      normalized.includes('private key') ||
-      normalized.includes('invalid_grant')
-    );
-  }
-
-  private hasOAuthCredentialsConfigured(): boolean {
-    const oauthClient = this.readOAuthClientCredentials();
-    const clientId = this.clientId ?? oauthClient?.clientId;
-    const clientSecret = this.clientSecret ?? oauthClient?.clientSecret;
-
-    return Boolean(clientId && clientSecret && this.refreshToken);
-  }
-
-  private looksLikeVideo(name: string, mimeType: string): boolean {
-    if (mimeType.startsWith('video/')) {
-      return true;
-    }
-    const lower = name.toLowerCase();
-    return ['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'].some((ext) => lower.endsWith(ext));
-  }
-
-  private looksLikeText(name: string, mimeType: string): boolean {
-    if (mimeType === 'text/plain') {
-      return true;
-    }
-    return name.toLowerCase().endsWith('.txt');
-  }
-
-  private videoMimeByName(name: string): string {
-    const lower = name.toLowerCase();
-    if (lower.endsWith('.mov')) return 'video/quicktime';
-    if (lower.endsWith('.webm')) return 'video/webm';
-    if (lower.endsWith('.mkv')) return 'video/x-matroska';
-    if (lower.endsWith('.avi')) return 'video/x-msvideo';
-    if (lower.endsWith('.m4v')) return 'video/x-m4v';
-    return 'video/mp4';
   }
 
   private async moveFileBetweenFolders(
@@ -773,4 +440,291 @@ export class GoogleDriveService {
     });
   }
 
+  private async listFilesPaged(
+    drive: drive_v3.Drive,
+    params: drive_v3.Params$Resource$Files$List,
+  ): Promise<drive_v3.Schema$File[]> {
+    const all: drive_v3.Schema$File[] = [];
+    let pageToken: string | undefined;
+    do {
+      const response = await drive.files.list({ ...params, pageToken });
+      all.push(...(response.data.files ?? []));
+      pageToken = response.data.nextPageToken ?? undefined;
+    } while (pageToken);
+    return all;
+  }
+
+  private async getDriveClients(): Promise<Array<{ kind: DriveClientKind; drive: drive_v3.Drive }>> {
+    const clients: Array<{ kind: DriveClientKind; drive: drive_v3.Drive }> = [];
+    const service = await this.getServiceDrive();
+    if (service) {
+      clients.push({ kind: 'service', drive: service });
+    }
+    try {
+      const oauth = await this.getOAuthDrive();
+      clients.push({ kind: 'oauth', drive: oauth });
+    } catch (error) {
+      this.logger.warn(`OAuth Drive unavailable: ${error}`);
+    }
+    if (!clients.length) {
+      throw new Error('No Google Drive client available');
+    }
+    return clients;
+  }
+
+  private async getClientsByPriority(
+    fileId: string,
+  ): Promise<Array<{ kind: DriveClientKind; drive: drive_v3.Drive }>> {
+    const clients = await this.getDriveClients();
+    const preferred = this.sourceByFileId.get(fileId);
+    if (!preferred) {
+      return clients;
+    }
+    return clients.sort((left, right) => {
+      if (left.kind === preferred && right.kind !== preferred) return -1;
+      if (right.kind === preferred && left.kind !== preferred) return 1;
+      return 0;
+    });
+  }
+
+  private async getOAuthDrive(): Promise<drive_v3.Drive> {
+    if (this.oauthDrive) {
+      return this.oauthDrive;
+    }
+
+    const clientId = this.clean(process.env.GOOGLE_DRIVE_CLIENT_ID);
+    const clientSecret = this.clean(process.env.GOOGLE_DRIVE_CLIENT_SECRET);
+    const refreshToken = this.clean(process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
+    const accessToken = this.clean(process.env.GOOGLE_DRIVE_ACCESS_TOKEN);
+
+    if (!clientId || !clientSecret || !refreshToken) {
+      throw new Error('Google Drive OAuth credentials are missing');
+    }
+
+    const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
+    oauth2.setCredentials({
+      refresh_token: refreshToken,
+      access_token: accessToken,
+    });
+
+    try {
+      const token = await oauth2.getAccessToken();
+      if (!token.token) {
+        throw new Error('OAuth refresh returned empty access token');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Google Drive OAuth initialization failed: ${message}`);
+    }
+
+    this.oauthDrive = google.drive({ version: 'v3', auth: oauth2 });
+    return this.oauthDrive;
+  }
+
+  private async getServiceDrive(): Promise<drive_v3.Drive | undefined> {
+    if (this.serviceDrive) {
+      return this.serviceDrive;
+    }
+    if (this.serviceDriveInit) {
+      return this.serviceDriveInit;
+    }
+    if (this.serviceAccountDisabledReason) {
+      return undefined;
+    }
+
+    this.serviceDriveInit = this.createServiceDrive();
+    return this.serviceDriveInit;
+  }
+
+  private async createServiceDrive(): Promise<drive_v3.Drive | undefined> {
+    const raw =
+      this.clean(process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON) ??
+      this.decodeBase64(this.clean(process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64)) ??
+      (this.clean(process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH)
+        ? await fs.readFile(this.clean(process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH) as string, 'utf8')
+        : undefined);
+
+    if (!raw) {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const privateKey = typeof parsed.private_key === 'string' ? this.normalizePrivateKey(parsed.private_key) : undefined;
+      const clientEmail = typeof parsed.client_email === 'string' ? parsed.client_email.trim() : undefined;
+      if (!privateKey || !clientEmail) {
+        throw new Error('Service account JSON must include private_key and client_email');
+      }
+      this.assertServiceAccountPrivateKey(privateKey);
+      const auth = new google.auth.GoogleAuth({
+        credentials: {
+          ...parsed,
+          private_key: privateKey,
+          client_email: clientEmail,
+        },
+        scopes: ['https://www.googleapis.com/auth/drive'],
+      });
+      await auth.getClient();
+      this.serviceDrive = google.drive({ version: 'v3', auth });
+      return this.serviceDrive;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.serviceAccountDisabledReason = message;
+      this.logger.warn(`Service account disabled: ${message}`);
+      return undefined;
+    }
+  }
+
+  private handleDriveClientFailure(kind: DriveClientKind, error: unknown): void {
+    if (kind !== 'service') {
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    if (
+      normalized.includes('private key') ||
+      normalized.includes('invalid_grant') ||
+      normalized.includes('asn1') ||
+      normalized.includes('pem')
+    ) {
+      this.serviceAccountDisabledReason = message;
+      this.serviceDrive = undefined;
+      this.serviceDriveInit = Promise.resolve(undefined);
+    }
+  }
+
+  private async resolveFolderTarget(
+    drive: drive_v3.Drive,
+    folderId: string,
+  ): Promise<{ id: string; driveId: string | null }> {
+    const resolvedId = this.resolveRawFolderId(folderId);
+    if (this.folderMetaCache.has(resolvedId)) {
+      return this.folderMetaCache.get(resolvedId) as { id: string; driveId: string | null };
+    }
+
+    try {
+      const meta = await drive.files.get({
+        fileId: resolvedId,
+        fields: 'id,driveId,mimeType,shortcutDetails',
+        supportsAllDrives: true,
+      });
+      const mimeType = meta.data.mimeType ?? '';
+      if (
+        mimeType === 'application/vnd.google-apps.shortcut' &&
+        meta.data.shortcutDetails?.targetId &&
+        meta.data.shortcutDetails.targetMimeType === 'application/vnd.google-apps.folder'
+      ) {
+        const targetId = meta.data.shortcutDetails.targetId;
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,driveId',
+          supportsAllDrives: true,
+        });
+        const shortcutResolved = { id: targetId, driveId: targetMeta.data.driveId ?? null };
+        this.folderMetaCache.set(resolvedId, shortcutResolved);
+        return shortcutResolved;
+      }
+      const resolved = { id: resolvedId, driveId: meta.data.driveId ?? null };
+      this.folderMetaCache.set(resolvedId, resolved);
+      return resolved;
+    } catch {
+      const fallback = { id: resolvedId, driveId: null };
+      this.folderMetaCache.set(resolvedId, fallback);
+      return fallback;
+    }
+  }
+
+  private async resolveFolderId(drive: drive_v3.Drive, folderId: string): Promise<string> {
+    const target = await this.resolveFolderTarget(drive, folderId);
+    return target.id;
+  }
+
+  private getFolderId(folder: DriveFolderKey): string {
+    switch (folder) {
+      case 'ingest':
+        return this.appConfig.ingestFolderId;
+      case 'sent':
+        return this.appConfig.sentFolderId;
+      case 'written':
+        return this.appConfig.writtenFolderId;
+      case 'published':
+        return this.appConfig.publishedFolderId;
+      case 'tgDrafts':
+        return this.appConfig.tgDraftsFolderId;
+    }
+  }
+
+  private resolveRawFolderId(value: string): string {
+    return value.trim();
+  }
+
+  private clean(value: string | undefined): string | undefined {
+    if (!value) {
+      return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : undefined;
+  }
+
+  private decodeBase64(value: string | undefined): string | undefined {
+    if (!value) {
+      return undefined;
+    }
+    return Buffer.from(value, 'base64').toString('utf8');
+  }
+
+  private normalizePrivateKey(value: string): string {
+    const normalized = value
+      .trim()
+      .replace(/^"|"$/g, '')
+      .replace(/^'|'$/g, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\\n/g, '\n');
+    const begin = '-----BEGIN PRIVATE KEY-----';
+    const end = '-----END PRIVATE KEY-----';
+    if (!normalized.includes(begin) || !normalized.includes(end)) {
+      return normalized;
+    }
+    const body = normalized
+      .slice(normalized.indexOf(begin) + begin.length, normalized.indexOf(end))
+      .replace(/[\s\r\n]+/g, '')
+      .match(/.{1,64}/g)
+      ?.join('\n');
+    return `${begin}\n${body ?? ''}\n${end}`;
+  }
+
+  private assertServiceAccountPrivateKey(privateKey: string): void {
+    try {
+      const keyObject = createPrivateKey({ key: privateKey, format: 'pem' });
+      const sign = createSign('RSA-SHA256');
+      sign.update('apb-drive-validation');
+      sign.end();
+      sign.sign(keyObject);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid service account private_key format: ${message}`);
+    }
+  }
+
+  private looksLikeVideo(name: string, mimeType: string): boolean {
+    if (mimeType.startsWith('video/')) {
+      return true;
+    }
+    const lower = name.toLowerCase();
+    return ['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'].some((ext) => lower.endsWith(ext));
+  }
+
+  private looksLikeText(name: string, mimeType: string): boolean {
+    return mimeType === 'text/plain' || name.toLowerCase().endsWith('.txt');
+  }
+
+  private extensionByMime(mimeType: string): string {
+    if (mimeType === 'image/png') return '.png';
+    if (mimeType === 'image/webp') return '.webp';
+    return '.jpg';
+  }
+
+  private stripExtension(fileName: string): string {
+    return fileName.replace(/\.[^.]+$/, '');
+  }
 }

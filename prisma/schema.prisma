@@ -1,0 +1,176 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum VideoJobStatus {
+  DISCOVERED
+  PROCESSING
+  READY
+  PUBLISHING
+  PUBLISHED
+  RETRY_WAITING
+  PAUSED_FAILED
+}
+
+enum TelegramDraftStatus {
+  PENDING_REVIEW
+  PUBLISHED
+  DELETED
+}
+
+enum SocialPublicationStatus {
+  AWAITING_EXTERNAL_API_CONFIG
+  READY
+  PUBLISHING
+  PUBLISHED
+  FAILED
+}
+
+enum EditSessionStatus {
+  ACTIVE
+  CLOSED
+}
+
+model AppState {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model VideoJob {
+  id                  String         @id @default(cuid())
+  driveFileId         String         @unique
+  fileName            String
+  descriptionFileId   String?
+  descriptionFileName String?
+  createdTime         DateTime
+  status              VideoJobStatus @default(DISCOVERED)
+  transcriptText      String?
+  descriptionText     String?
+  scheduledFor        DateTime?
+  scheduledSlotKey    String?
+  publishAttempts     Int            @default(0)
+  publishedAt         DateTime?
+  lastError           String?
+  lastPublishPayload  Json?
+  lastPublishResult   Json?
+  deferredNotes       Json?
+  discoveredAt        DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([status, scheduledFor])
+}
+
+model ArticleRecord {
+  id           String   @id @default(cuid())
+  sourceName   String
+  sourceUrl    String
+  title        String
+  url          String
+  canonicalUrl String
+  dedupeKey    String   @unique
+  publishedAt  DateTime?
+  contentHash  String
+  excerpt      String?
+  bodyText     String?
+  clusterId    String?
+  discoveredAt DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  cluster ContentCluster? @relation(fields: [clusterId], references: [id], onDelete: SetNull)
+
+  @@index([clusterId])
+}
+
+model ContentCluster {
+  id                String              @id @default(cuid())
+  title             String
+  summary           String
+  sourceUrlsJson    String
+  articleIdsJson    String
+  fingerprint       String              @unique
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  articles          ArticleRecord[]
+  telegramDrafts    TelegramDraft[]
+  socialPublications SocialPublication[]
+}
+
+model TelegramDraft {
+  id               String              @id @default(cuid())
+  clusterId        String
+  title            String
+  body             String
+  textFileId       String?
+  imageFileId      String?
+  imageMimeType    String?
+  sourceUrlsJson   String
+  previewChatId    String?
+  previewMessageId String?
+  channelMessageId String?
+  rewriteOfDraftId String?
+  status           TelegramDraftStatus @default(PENDING_REVIEW)
+  publishedAt      DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  cluster      ContentCluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  editSessions EditSession[]
+
+  @@index([status, createdAt])
+}
+
+model EditSession {
+  id              String            @id @default(cuid())
+  telegramDraftId String
+  ownerChatId     String
+  promptMessageId String?
+  status          EditSessionStatus @default(ACTIVE)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  telegramDraft TelegramDraft @relation(fields: [telegramDraftId], references: [id], onDelete: Cascade)
+
+  @@index([ownerChatId, status])
+}
+
+model SocialPublication {
+  id               String                  @id @default(cuid())
+  clusterId        String
+  title            String
+  body             String
+  imagePrompt      String?
+  imageFileId      String?
+  imageMimeType    String?
+  textFileId       String?
+  folderStem       String
+  scheduledFor     DateTime?
+  scheduledSlotKey String?
+  status           SocialPublicationStatus @default(AWAITING_EXTERNAL_API_CONFIG)
+  publishAttempts  Int                     @default(0)
+  publishedAt      DateTime?
+  lastError        String?
+  lastPayload      Json?
+  lastResult       Json?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  cluster ContentCluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+}
+
+model NotificationEvent {
+  id         String   @id @default(cuid())
+  kind       String
+  entityId   String?
+  chatId     String?
+  messageId  String?
+  payload    String?
+  createdAt  DateTime @default(now())
+}

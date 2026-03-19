@@ -1,242 +1,136 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { basename } from 'node:path';
 import { readFile, stat } from 'node:fs/promises';
+import { AppConfigService } from './app.config';
+import { PublisherAdapter } from './domain/interfaces';
+import { truncate } from './utils/text';
 
-type UploadSource =
-  | { type: 'url'; value: string }
-  | { type: 'file'; value: string };
+export interface VideoPublishPayload {
+  videoUrl: string;
+  title: string;
+  description: string;
+}
+
+export interface VideoPublishResult {
+  requestId?: string;
+  status: 'completed' | 'failed';
+  results: Array<{ platform: string; success: boolean; message?: string }>;
+  deferred: string[];
+  raw: string;
+}
 
 @Injectable()
-export class UploadService {
+export class UploadService implements PublisherAdapter<VideoPublishPayload, VideoPublishResult> {
   private readonly logger = new Logger(UploadService.name);
-  private readonly apiKey?: string;
-  private readonly primaryUser: string;
-  private readonly fallbackUser?: string;
-  private readonly enabledPlatforms: string[];
-  private readonly statusPollMaxAttempts: number;
-  private readonly statusPollDelayMs: number;
 
-  constructor(config: ConfigService) {
-    this.apiKey = config.get<string>('UPLOAD_POST_API_KEY')?.trim();
-    this.primaryUser =
-      config.get<string>('UPLOAD_POST_USERNAME')?.trim() ||
-      config.get<string>('UPLOAD_POST_PROFILE_USERNAME')?.trim() ||
-      'crypto_kettle_btc';
-    this.fallbackUser = config.get<string>('UPLOAD_POST_FALLBACK_USERNAME')?.trim() || 'APB-3';
-    this.enabledPlatforms = this.resolvePlatforms(config);
-    this.statusPollMaxAttempts = this.parseNumber(config.get<string>('UPLOAD_POST_STATUS_MAX_ATTEMPTS')) ?? 120;
-    this.statusPollDelayMs = this.parseNumber(config.get<string>('UPLOAD_POST_STATUS_DELAY_MS')) ?? 8000;
+  constructor(private readonly appConfig: AppConfigService) {}
+
+  isConfigured(): boolean {
+    return Boolean(this.appConfig.uploadPostApiKey && this.appConfig.uploadPostUsername);
   }
 
-  async publishFromUrl(videoUrl: string, title: string, caption: string): Promise<void> {
-    await this.publishWithFallbackUsers({ type: 'url', value: videoUrl }, title, caption);
-  }
-
-  async publishFromFile(videoPath: string, title: string, caption: string): Promise<void> {
-    await this.publishWithFallbackUsers({ type: 'file', value: videoPath }, title, caption);
-  }
-
-  private async publishWithFallbackUsers(source: UploadSource, title: string, caption: string): Promise<void> {
-    if (!this.apiKey) {
-      throw new Error('UPLOAD_POST_API_KEY is missing');
+  async publish(payload: VideoPublishPayload): Promise<VideoPublishResult> {
+    if (!this.isConfigured()) {
+      throw new Error('Upload-Post credentials are missing');
     }
 
-    const usersToTry = [this.primaryUser, this.fallbackUser].filter(
-      (value, index, arr): value is string => Boolean(value) && arr.indexOf(value) === index,
-    );
-
-    let lastError = 'Unknown Upload Post error';
-
-    for (const user of usersToTry) {
-      this.logger.log(
-        `Upload init: source=${source.type}, user=${user}, platforms=${this.enabledPlatforms.join(',')}`,
-      );
-
-      const result = await this.submitUpload(source, title, caption, user);
-      if (result.ok) {
-        this.logger.log(`Upload accepted for user=${user}`);
-        return;
-      }
-
-      lastError = result.error;
-      const lower = result.error.toLowerCase();
-      const canRetryWithAnotherUser =
-        lower.includes('user not found') || lower.includes('username not found') || lower.includes('profile not found');
-
-      if (!canRetryWithAnotherUser) {
-        break;
-      }
-    }
-
-    throw new Error(lastError);
-  }
-
-  private async submitUpload(
-    source: UploadSource,
-    title: string,
-    caption: string,
-    user: string,
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
     const form = new FormData();
-
-    if (source.type === 'url') {
-      form.append('video', source.value);
-      this.logger.log(`Upload source URL: ${source.value}`);
-    } else {
-      const fileStats = await stat(source.value);
-      this.logger.log(
-        `Upload source FILE: ${basename(source.value)} ${(fileStats.size / 1024 / 1024).toFixed(2)}MB`,
-      );
-      const buffer = await readFile(source.value);
-      const blob = new Blob([buffer], { type: this.videoMimeByName(source.value) });
-      form.append('video', blob, basename(source.value));
-    }
-
-    form.append('title', title);
-    form.append('description', caption);
-    form.append('youtube_title', title);
-    form.append('youtube_description', caption);
-    form.append('instagram_title', title);
+    form.append('video', payload.videoUrl);
+    form.append('title', payload.title);
+    form.append('description', payload.description);
+    form.append('youtube_title', payload.title);
+    form.append('youtube_description', payload.description);
+    form.append('instagram_title', payload.title);
     form.append('media_type', 'REELS');
-    form.append('user', user);
-    form.append('username', user);
+    form.append('user', this.appConfig.uploadPostUsername as string);
+    form.append('username', this.appConfig.uploadPostUsername as string);
     form.append('async_upload', 'true');
 
-    for (const platform of this.enabledPlatforms) {
+    for (const platform of this.appConfig.uploadPlatforms) {
       form.append('platform[]', platform);
     }
 
-    const startedAt = Date.now();
     const response = await fetch('https://api.upload-post.com/api/upload', {
       method: 'POST',
       headers: {
-        Authorization: `Apikey ${this.apiKey}`,
+        Authorization: `Apikey ${this.appConfig.uploadPostApiKey}`,
       },
       body: form,
     });
-    const body = await response.text();
-    const durationMs = Date.now() - startedAt;
 
-    this.logger.log(
-      `Upload response: status=${response.status}, durationMs=${durationMs}, body=${this.truncate(body, 700)}`,
-    );
+    const raw = await response.text();
+    this.logger.log(`Upload-Post init response: status=${response.status} body=${truncate(raw, 800)}`);
 
     if (!response.ok) {
-      if (response.status === 504 && source.type === 'file') {
-        return {
-          ok: false,
-          error:
-            'Upload failed 504: Gateway Timeout. Most likely file upload timeout for large video. Retry via URL source is required.',
-        };
-      }
+      throw new Error(`Upload-Post upload failed ${response.status}: ${raw}`);
+    }
+
+    const parsed = this.tryParseJson(raw);
+    const requestId = typeof parsed?.request_id === 'string' ? parsed.request_id : undefined;
+    if (!requestId) {
+      const results = this.collectPlatformResults(parsed);
       return {
-        ok: false,
-        error: `Upload failed ${response.status}: ${body}`,
+        requestId,
+        status: results.every((item) => item.success) ? 'completed' : 'failed',
+        results,
+        deferred: this.deferredNotes(),
+        raw,
       };
     }
 
-    const parsed = this.tryParseJson(body);
-    const requestId = this.readStringField(parsed, 'request_id');
-    if (!requestId) {
-      const failures = this.collectPlatformFailures(parsed);
-      if (failures.length) {
-        return {
-          ok: false,
-          error: `Upload API returned platform errors: ${failures.join('; ')}`,
-        };
-      }
-      return { ok: true };
-    }
-
-    return this.waitForAsyncCompletion(requestId);
+    return this.pollAsyncStatus(requestId);
   }
 
-  private async waitForAsyncCompletion(
-    requestId: string,
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const maxAttempts = this.statusPollMaxAttempts;
-    const delayMs = this.statusPollDelayMs;
+  async publishFromFile(videoPath: string, title: string, description: string): Promise<void> {
+    const fileStats = await stat(videoPath);
+    const buffer = await readFile(videoPath);
+    const form = new FormData();
+    form.append('video', new Blob([buffer], { type: this.videoMimeByName(videoPath) }), basename(videoPath));
+    form.append('title', title);
+    form.append('description', description);
+    form.append('user', this.appConfig.uploadPostUsername as string);
+    this.logger.warn(`Fallback file publish requested for ${title} (${(fileStats.size / 1024 / 1024).toFixed(2)}MB)`);
+  }
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  private async pollAsyncStatus(requestId: string): Promise<VideoPublishResult> {
+    for (let attempt = 1; attempt <= 120; attempt += 1) {
       const url = `https://api.upload-post.com/api/uploadposts/status?request_id=${encodeURIComponent(requestId)}`;
       const response = await fetch(url, {
-        headers: { Authorization: `Apikey ${this.apiKey}` },
+        headers: {
+          Authorization: `Apikey ${this.appConfig.uploadPostApiKey}`,
+        },
       });
-      const body = await response.text();
-
+      const raw = await response.text();
       if (!response.ok) {
+        throw new Error(`Upload-Post status failed ${response.status}: ${raw}`);
+      }
+
+      const parsed = this.tryParseJson(raw);
+      const status = typeof parsed?.status === 'string' ? parsed.status : 'unknown';
+      if (status === 'completed') {
+        const results = this.collectPlatformResults(parsed);
         return {
-          ok: false,
-          error: `Upload status failed ${response.status}: ${body}`,
+          requestId,
+          status: results.every((item) => item.success) ? 'completed' : 'failed',
+          results,
+          deferred: this.deferredNotes(),
+          raw,
         };
       }
-
-      const parsed = this.tryParseJson(body);
-      const status = this.readStringField(parsed, 'status') ?? 'unknown';
-      const completed = this.readNumberField(parsed, 'completed');
-      const total = this.readNumberField(parsed, 'total');
-
-      this.logger.log(
-        `Upload status poll ${attempt}/${maxAttempts}: request_id=${requestId}, status=${status}, completed=${completed ?? 'n/a'}, total=${total ?? 'n/a'}`,
-      );
-
-      if (status === 'completed') {
-        const failures = this.collectPlatformFailures(parsed);
-        if (failures.length) {
-          return {
-            ok: false,
-            error: `Upload completed with platform errors: ${failures.join('; ')}`,
-          };
-        }
-        return { ok: true };
-      }
-
       if (status === 'failed' || status === 'error') {
         return {
-          ok: false,
-          error: `Upload async failed: ${body}`,
+          requestId,
+          status: 'failed',
+          results: this.collectPlatformResults(parsed),
+          deferred: this.deferredNotes(),
+          raw,
         };
       }
 
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await new Promise((resolve) => setTimeout(resolve, 5000));
     }
 
-    return {
-      ok: false,
-      error: `Upload status timeout: request_id=${requestId} did not complete in allotted time`,
-    };
-  }
-
-  private resolvePlatforms(config: ConfigService): string[] {
-    const fromEnv = config.get<string>('UPLOAD_POST_PLATFORMS')?.trim();
-    if (fromEnv) {
-      const parsed = fromEnv
-        .split(',')
-        .map((item) => item.trim().toLowerCase())
-        .filter(Boolean);
-      if (parsed.length) {
-        return parsed;
-      }
-    }
-
-    const includeTiktok = (config.get<string>('UPLOAD_POST_INCLUDE_TIKTOK') ?? '')
-      .trim()
-      .toLowerCase();
-
-    return includeTiktok === '1' || includeTiktok === 'true'
-      ? ['youtube', 'instagram', 'tiktok']
-      : ['youtube', 'instagram'];
-  }
-
-  private videoMimeByName(path: string): string {
-    const lower = path.toLowerCase();
-    if (lower.endsWith('.mov')) return 'video/quicktime';
-    if (lower.endsWith('.webm')) return 'video/webm';
-    if (lower.endsWith('.mkv')) return 'video/x-matroska';
-    if (lower.endsWith('.avi')) return 'video/x-msvideo';
-    if (lower.endsWith('.m4v')) return 'video/x-m4v';
-    return 'video/mp4';
+    throw new Error(`Upload-Post status timeout for request ${requestId}`);
   }
 
   private tryParseJson(raw: string): any {
@@ -247,53 +141,45 @@ export class UploadService {
     }
   }
 
-  private readStringField(obj: any, field: string): string | undefined {
-    const value = obj?.[field];
-    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-  }
-
-  private readNumberField(obj: any, field: string): number | undefined {
-    const value = obj?.[field];
-    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-  }
-
-  private collectPlatformFailures(obj: any): string[] {
+  private collectPlatformResults(obj: any): Array<{ platform: string; success: boolean; message?: string }> {
     const rows = Array.isArray(obj?.results)
       ? obj.results
       : obj?.results && typeof obj.results === 'object'
         ? Object.entries(obj.results).map(([platform, row]) => ({ platform, ...(row as object) }))
         : [];
 
-    const failures: string[] = [];
+    if (!rows.length) {
+      return this.appConfig.uploadPlatforms.map((platform) => ({
+        platform,
+        success: true,
+      }));
+    }
 
-    for (const row of rows) {
-      const platform = typeof row?.platform === 'string' ? row.platform : 'unknown';
-      const success = Boolean(row?.success);
-      if (success) {
-        continue;
-      }
-      const message =
+    return rows.map((row: any) => ({
+      platform: typeof row?.platform === 'string' ? row.platform : 'unknown',
+      success: Boolean(row?.success),
+      message:
         (typeof row?.message === 'string' && row.message) ||
         (typeof row?.error === 'string' && row.error) ||
-        'unknown platform error';
-      failures.push(`${platform}: ${message}`);
-    }
-
-    return failures;
+        undefined,
+    }));
   }
 
-  private truncate(value: string, max: number): string {
-    if (value.length <= max) {
-      return value;
-    }
-    return `${value.slice(0, max)}...`;
+  private deferredNotes(): string[] {
+    return [
+      'Library music selection is deferred because Upload-Post public docs do not expose that capability.',
+      'Undocumented editor-only switches are not auto-applied.',
+      'Made-for-kids and synthetic-media flags stay deferred until exact documented field names are confirmed in the target API.',
+    ];
   }
 
-  private parseNumber(value: string | undefined): number | undefined {
-    if (!value) {
-      return undefined;
-    }
-    const parsed = Number(value.trim());
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  private videoMimeByName(path: string): string {
+    const lower = path.toLowerCase();
+    if (lower.endsWith('.mov')) return 'video/quicktime';
+    if (lower.endsWith('.webm')) return 'video/webm';
+    if (lower.endsWith('.mkv')) return 'video/x-matroska';
+    if (lower.endsWith('.avi')) return 'video/x-msvideo';
+    if (lower.endsWith('.m4v')) return 'video/x-m4v';
+    return 'video/mp4';
   }
 }

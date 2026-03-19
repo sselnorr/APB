@@ -1,167 +1,77 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# APB Content Machine
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS service for:
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+- Google Drive ingest -> video description generation -> scheduled multi-platform publishing
+- Telegram bot operator workflow for channel drafts with approve/edit/delete/rewrite
+- Article ingestion -> summarize -> Telegram draft + social written draft generation
+- Railway-ready long-running runtime with PostgreSQL as the system of record
 
-## Description
+## Main Flow
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+### Video
 
-## Project setup
+- New videos are discovered in `GOOGLE_DRIVE_INGEST_FOLDER_ID`
+- Each video is processed in `createdTime` order
+- A sibling `.txt` description is created directly in `INGEST`
+- The oldest ready unpublished video is scheduled into the next Berlin publish window
+- After successful publication to all configured platforms, video and `.txt` move to `Sent`
 
-```bash
-$ npm install
-```
+### Telegram Drafts
 
-## Compile and run the project
+- Article sources are scanned every 6 hours
+- New materials are summarized into a cluster
+- A Telegram draft is created and sent to the owner chat with inline actions
+- `Publish` posts to `TELEGRAM_CHANNEL_ID`
+- `Edit` accepts text, photo, or text + photo and rewrites the stored draft assets
 
-```bash
-# development
-$ npm run start
+### Social Written Queue
 
-# watch mode
-$ npm run start:dev
+- The same article cluster also creates a `Written` text + image draft
+- These items are scheduled with the same publish windows
+- Real X/Threads/Facebook publishing is intentionally stubbed until external API details are provided
 
-# production mode
-$ npm run start:prod
-```
+## Required Environment
 
-## Google Drive video download
+Use `.env.example` as the only source of truth for required variables.
 
-On app startup, the service can fetch video files from Google Drive, download them locally, and print the downloaded file list to the console.
+Important variables:
 
-Set these environment variables before `npm run start`:
+- `DATABASE_URL`
+- `APP_TIMEZONE`
+- `PUBLISH_WINDOWS`
+- `GOOGLE_DRIVE_INGEST_FOLDER_ID`
+- `GOOGLE_DRIVE_SENT_FOLDER_ID`
+- `GOOGLE_DRIVE_WRITTEN_FOLDER_ID`
+- `GOOGLE_DRIVE_PUBLISHED_FOLDER_ID`
+- `GOOGLE_DRIVE_TG_DRAFTS_FOLDER_ID`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_OWNER_CHAT_ID`
+- `TELEGRAM_CHANNEL_ID`
+- `OPENAI_API_KEY`
+- `UPLOAD_POST_API_KEY`
+- `UPLOAD_POST_USERNAME`
+- `ARTICLE_SOURCES_JSON`
 
-```bash
-# Option A (simple): short-lived OAuth2 access token with Drive read scope
-GOOGLE_DRIVE_ACCESS_TOKEN=ya29....
-
-# Option B (recommended): long-lived refresh flow
-GOOGLE_DRIVE_CLIENT_ID=...
-GOOGLE_DRIVE_CLIENT_SECRET=...
-GOOGLE_DRIVE_REFRESH_TOKEN=...
-
-# Option C (service account): use one of these
-GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_PATH=autoposting-489119-64d5f54a634b.json
-# or raw JSON content in a variable:
-# GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON={"type":"service_account",...}
-# or the same JSON encoded as base64:
-# GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64=eyJ0eXBlIjoic2VydmljZV9hY2NvdW50IiwuLi59
-
-# Optional alternative: instead of GOOGLE_DRIVE_CLIENT_ID / SECRET,
-# you can pass the full OAuth client JSON file contents:
-# GOOGLE_DRIVE_OAUTH_CLIENT_JSON={"installed":{"client_id":"...","client_secret":"..."}}
-# or base64:
-# GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64=eyJpbnN0YWxsZWQiOnsiY2xpZW50X2lkIjoiLi4uIn19
-
-# Optional: only read videos from this folder
-GOOGLE_DRIVE_FOLDER_ID=your_folder_id
-
-# Optional: target directory for downloads (default: downloads/videos)
-GOOGLE_DRIVE_DOWNLOAD_DIR=downloads/videos
-```
-
-If you use Service Account, share the target Google Drive folder/files with the service account email (`client_email` from the key JSON).
-
-## Railway deploy
-
-This repository contains a production `Dockerfile`, so Railway will use Docker instead of Railpack auto-detection. That avoids mismatches between build-time and runtime commands and makes deploys deterministic.
-
-Set these Railway variables:
+## Local Commands
 
 ```bash
-PORT=4200
-GOOGLE_DRIVE_FOLDER_ID=...
-GOOGLE_DRIVE_RESULT_FOLDER_ID=...
-GOOGLE_DRIVE_SENT_FOLDER_ID=...
-GOOGLE_DRIVE_CLIENT_ID=...
-GOOGLE_DRIVE_CLIENT_SECRET=...
-GOOGLE_DRIVE_REFRESH_TOKEN=...
-# preferred for the service account on Railway:
-GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON=...or...
-GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64=...
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_TARGET_CHAT_ID=...
-OPENAI_API_KEY=...
-UPLOAD_POST_API_KEY=...
-UPLOAD_POST_USERNAME=...
+npm install --include=dev
+npx prisma generate
+npm run build
+node ./node_modules/jest/bin/jest.js --runInBand
+node ./node_modules/jest/bin/jest.js --config test/jest-e2e.json --runInBand
 ```
 
-`client_secret_*.json` does not need to be committed to GitHub. You can either:
+## Railway Notes
 
-- extract `client_id` and `client_secret` from that JSON and store them as Railway variables;
-- or paste the full file content into `GOOGLE_DRIVE_OAUTH_CLIENT_JSON`;
-- or store the file as base64 in `GOOGLE_DRIVE_OAUTH_CLIENT_JSON_BASE64`.
+- The runtime image installs `ffmpeg`
+- Prisma client is generated inside the Docker image
+- Secrets should live in Railway environment variables, not in committed files
+- The Telegram bot must be admin in the target channel
 
-The service account key should also stay out of Git. Use `GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON` or `GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY_JSON_BASE64` in Railway instead of committing the `.json` file.
+## Current Deliberate Limitations
 
-## Run tests
-
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+- Notion sync is a placeholder adapter only
+- Social network publisher for X/Threads/Facebook is a placeholder adapter only
+- Upload-Post undocumented editor features like platform music library selection remain deferred
