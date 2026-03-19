@@ -1,125 +1,184 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
-import { existsSync, readFileSync, createReadStream } from 'node:fs';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { ArticleRecord } from '@prisma/client';
+import { AppConfigService } from './app.config';
+import { ContentClusterDto, DraftContent, ImageGeneratorAdapter } from './domain/interfaces';
+
+interface JsonDraftResponse {
+  title?: string;
+  body?: string;
+  summary?: string;
+  imagePrompt?: string;
+}
 
 @Injectable()
-export class AiService {
+export class AiService implements ImageGeneratorAdapter {
   private readonly logger = new Logger(AiService.name);
-  private readonly client: OpenAI;
-  private readonly systemPrompt: string;
+  private readonly client?: OpenAI;
 
-  constructor(config: ConfigService) {
-    const apiKey = config.get<string>('OPENAI_API_KEY');
-    if (!apiKey) {
-      throw new Error('OPENAI_API_KEY is required');
+  constructor(private readonly appConfig: AppConfigService) {
+    if (this.appConfig.openAiApiKey) {
+      this.client = new OpenAI({ apiKey: this.appConfig.openAiApiKey });
     }
-    this.client = new OpenAI({ apiKey });
-    const promptPath = this.resolveSystemPromptPath(config.get<string>('SYSTEM_PROMPT_PATH'));
-    this.systemPrompt = readFileSync(promptPath, 'utf8');
   }
 
-  async transcribeVideo(videoPath: string): Promise<string> {
-    const tempDir = await mkdtemp(join(tmpdir(), 'apb-transcribe-'));
-    const audioPath = join(tempDir, 'audio-for-transcription.mp3');
+  isConfigured(): boolean {
+    return Boolean(this.client);
+  }
+
+  async transcribeAudio(audioPath: string): Promise<string> {
+    if (!this.client) {
+      throw new Error('OPENAI_API_KEY is missing');
+    }
+
+    const transcript = await this.client.audio.transcriptions.create({
+      file: createReadStream(audioPath),
+      model: this.appConfig.openAiTranscribeModel,
+      response_format: 'text',
+      language: 'ru',
+    });
+
+    return transcript.trim();
+  }
+
+  async generateVideoDescription(transcript: string, videoName: string): Promise<string> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.videoPrompt },
+      {
+        role: 'user',
+        content: `Название видео: ${videoName}\n\nТранскрипт:\n${transcript}\n\nВерни JSON { "body": "..." }`,
+      },
+    ]);
+
+    return response.body?.trim() || response.summary?.trim() || transcript.slice(0, 500);
+  }
+
+  async buildCluster(articles: ArticleRecord[]): Promise<ContentClusterDto> {
+    const sources = articles.map((article) => `- ${article.title}\nURL: ${article.canonicalUrl}\n${article.excerpt ?? ''}`).join('\n\n');
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.articleClusterPrompt },
+      {
+        role: 'user',
+        content: `Новые материалы:\n${sources}\n\nВерни JSON { "title": "...", "summary": "..." }`,
+      },
+    ]);
+
+    const title = response.title?.trim() || articles[0]?.title || 'Новый дайджест';
+    const summary = response.summary?.trim() || response.body?.trim() || sources.slice(0, 2000);
+
+    return {
+      title,
+      summary,
+      sourceUrls: articles.map((article) => article.canonicalUrl),
+      articleIds: articles.map((article) => article.id),
+      fingerprint: articles.map((article) => article.dedupeKey).sort().join('|'),
+    };
+  }
+
+  async generateTelegramDraft(summary: string, sourceUrls: string[]): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.telegramDraftPrompt },
+      {
+        role: 'user',
+        content: `Summary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Telegram Draft',
+      body: response.body?.trim() || summary,
+    };
+  }
+
+  async rewriteTelegramDraft(currentBody: string, summary: string, sourceUrls: string[]): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.telegramDraftPrompt },
+      {
+        role: 'user',
+        content: `Перепиши пост по той же теме иначе.\n\nТекущий текст:\n${currentBody}\n\nSummary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Telegram Draft',
+      body: response.body?.trim() || currentBody,
+    };
+  }
+
+  async generateSocialDraft(summary: string, sourceUrls: string[]): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.socialDraftPrompt },
+      {
+        role: 'user',
+        content: `Summary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Social Draft',
+      body: response.body?.trim() || summary,
+    };
+  }
+
+  async generateImagePrompt(summary: string, socialBody: string): Promise<string> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.imagePromptPrompt },
+      {
+        role: 'user',
+        content: `Summary:\n${summary}\n\nТекст публикации:\n${socialBody}\n\nВерни JSON { "imagePrompt": "..." }`,
+      },
+    ]);
+
+    return response.imagePrompt?.trim() || `Create a clean editorial illustration for: ${socialBody}`;
+  }
+
+  async generate(prompt: string): Promise<{ mimeType: string; bytes: Buffer }> {
+    if (!this.client) {
+      throw new Error('OPENAI_API_KEY is missing');
+    }
+
+    const image = await this.client.images.generate({
+      model: this.appConfig.openAiImageModel,
+      prompt,
+      size: '1536x1024',
+    });
+
+    const b64 = image.data?.[0]?.b64_json;
+    if (!b64) {
+      throw new Error('Image generation returned no image data');
+    }
+
+    return {
+      mimeType: 'image/png',
+      bytes: Buffer.from(b64, 'base64'),
+    };
+  }
+
+  private async chatJson(
+    messages: Array<{ role: 'system' | 'user'; content: string }>,
+  ): Promise<JsonDraftResponse> {
+    if (!this.client) {
+      throw new Error('OPENAI_API_KEY is missing');
+    }
+
+    const response = await this.client.chat.completions.create({
+      model: this.appConfig.openAiTextModel,
+      messages,
+      temperature: 0.5,
+      response_format: { type: 'json_object' },
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) {
+      this.logger.warn('OpenAI returned empty content');
+      return {};
+    }
 
     try {
-      await this.extractSpeechAudio(videoPath, audioPath);
-      const audioStats = await stat(audioPath);
-      const sizeMb = audioStats.size / 1024 / 1024;
-      const sizeLabel = sizeMb >= 1 ? `${sizeMb.toFixed(2)} MB` : `${(audioStats.size / 1024).toFixed(1)} KB`;
-      this.logger.log(`Prepared audio for transcription: ${sizeLabel}`);
-
-      const transcript = await this.client.audio.transcriptions.create({
-        file: createReadStream(audioPath),
-        model: 'whisper-1',
-        response_format: 'text',
-        language: 'ru',
-      });
-      return transcript;
-    } finally {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      return JSON.parse(content) as JsonDraftResponse;
+    } catch {
+      return { body: content, summary: content };
     }
-  }
-
-  async generateDescription(script: string, videoName: string): Promise<string> {
-    const result = await this.client.chat.completions.create({
-      model: 'gpt-4.1',
-      messages: [
-        { role: 'system', content: this.systemPrompt },
-        { role: 'user', content: `Название видео: ${videoName}\n\nСценарий/транскрипт:\n${script}` },
-      ],
-      temperature: 0.6,
-      max_tokens: 400,
-    });
-
-    const content = result.choices[0]?.message?.content;
-    if (!content) {
-      this.logger.error('OpenAI response was empty');
-      throw new Error('Не удалось сгенерировать описание');
-    }
-    return content.trim();
-  }
-
-  private async extractSpeechAudio(videoPath: string, audioPath: string): Promise<void> {
-    const args = [
-      '-y',
-      '-i',
-      videoPath,
-      '-vn',
-      '-ac',
-      '1',
-      '-ar',
-      '16000',
-      '-b:a',
-      '24k',
-      '-codec:a',
-      'libmp3lame',
-      audioPath,
-    ];
-
-    await new Promise<void>((resolve, reject) => {
-      const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-      let stderr = '';
-
-      ffmpeg.stderr.on('data', (chunk) => {
-        stderr += chunk.toString();
-      });
-
-      ffmpeg.on('error', (error) => reject(error));
-      ffmpeg.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-          return;
-        }
-        reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
-      });
-    });
-  }
-
-  private resolveSystemPromptPath(configuredPath: string | undefined): string {
-    if (configuredPath?.trim()) {
-      return configuredPath.trim();
-    }
-
-    const candidates = [
-      resolve(__dirname, 'assets', 'system-prompt.md'),
-      resolve(process.cwd(), 'dist', 'src', 'assets', 'system-prompt.md'),
-      resolve(process.cwd(), 'src', 'assets', 'system-prompt.md'),
-      resolve(process.cwd(), 'system-prompt.md'),
-    ];
-
-    const found = candidates.find((candidate) => existsSync(candidate));
-    if (found) {
-      return found;
-    }
-
-    throw new Error(
-      `SYSTEM_PROMPT_PATH is not set and default prompt file was not found. Checked: ${candidates.join(', ')}`,
-    );
   }
 }
