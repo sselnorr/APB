@@ -18,7 +18,7 @@ import { SocialPublisherService } from './social-publisher.service';
 import { TelegramBotService } from './telegram.service';
 import { UploadService } from './upload.service';
 import { nextPublishSlot, publishSlotKey } from './utils/time';
-import { sha256, slugify, stripExtension, truncate } from './utils/text';
+import { normalizeVideoDescription, sha256, slugify, stripExtension, truncate } from './utils/text';
 
 @Injectable()
 export class AppService implements OnModuleInit, OnModuleDestroy {
@@ -165,7 +165,7 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
       const extracted = await this.media.extractSpeechAudio(tempVideoPath);
       try {
         const transcript = await this.ai.transcribeAudio(extracted.audioPath);
-        const description = await this.ai.generateVideoDescription(transcript, job.fileName);
+        const description = normalizeVideoDescription(await this.ai.generateVideoDescription(transcript, job.fileName));
         const textAsset = await this.drive.upsertIngestDescription(job.fileName, description);
 
         await this.prisma.videoJob.update({
@@ -226,9 +226,9 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const description = job.descriptionText?.trim()
-        ? job.descriptionText
+        ? normalizeVideoDescription(job.descriptionText)
         : job.descriptionFileId
-          ? await this.drive.readTextFile(job.descriptionFileId)
+          ? normalizeVideoDescription(await this.drive.readTextFile(job.descriptionFileId))
           : '';
       if (!description.trim()) {
         throw new Error('Описание видео отсутствует');
@@ -279,7 +279,7 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
           `Описание:`,
           description,
           '',
-          `Применённые поля: title, description, youtube_title, youtube_description, instagram_title, media_type=REELS, async_upload=true, platform[]`,
+          `Применённые поля: title, description, tiktok_title, youtube_title, youtube_description, instagram_title, instagram_first_comment, youtube_first_comment, media_type=REELS, share_to_feed=true, privacy_level=PUBLIC_TO_EVERYONE, privacyStatus=public, post_mode=DIRECT_POST, selfDeclaredMadeForKids=false, containsSyntheticMedia=false, defaultLanguage=ru, defaultAudioLanguage=ru-RU, is_aigc=false, async_upload=true, platform[]`,
           `Deferred: ${publishResult.deferred.join(' | ')}`,
         ].join('\n'),
       );
@@ -433,12 +433,24 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
     const textAsset = await this.drive.upsertWrittenText(stem, socialDraft.body);
     let imageAssetId: string | undefined;
     let imageMimeType: string | undefined;
+    let status: SocialPublicationStatus = this.socialPublisher.isConfigured()
+      ? SocialPublicationStatus.READY
+      : SocialPublicationStatus.AWAITING_EXTERNAL_API_CONFIG;
+    let lastError: string | null = null;
 
     if (this.ai.isConfigured()) {
       const generated = await this.ai.generate(imagePrompt);
       const imageAsset = await this.drive.uploadWrittenImage(stem, generated.bytes, generated.mimeType);
       imageAssetId = imageAsset.id;
       imageMimeType = generated.mimeType;
+    } else {
+      status = SocialPublicationStatus.FAILED;
+      lastError = 'Image generation is not configured';
+    }
+
+    if (!imageAssetId) {
+      status = SocialPublicationStatus.FAILED;
+      lastError = lastError ?? 'Social publication image was not generated';
     }
 
     const scheduledFor = await this.nextSlotForSocial();
@@ -454,9 +466,8 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
         folderStem: stem,
         scheduledFor,
         scheduledSlotKey: publishSlotKey(scheduledFor, this.appConfig.timezone),
-        status: this.socialPublisher.isConfigured()
-          ? SocialPublicationStatus.READY
-          : SocialPublicationStatus.AWAITING_EXTERNAL_API_CONFIG,
+        status,
+        lastError,
       },
     });
   }
@@ -488,8 +499,17 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
         title: item.title,
         body: item.body,
         imageFileId: item.imageFileId,
+        imageMimeType: item.imageMimeType,
         textFileId: item.textFileId,
       });
+
+      const successfulPlatforms = result.results.filter((row) => row.success);
+      if (!successfulPlatforms.length) {
+        throw new Error(
+          result.results.map((row) => `${row.platform}: ${row.message ?? 'unknown error'}`).join('; ') ||
+            'unknown social publish failure',
+        );
+      }
 
       if (!item.textFileId) {
         throw new Error('textFileId is missing');
@@ -505,6 +525,18 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
           lastError: null,
         },
       });
+
+      const failedPlatforms = result.results.filter((row) => !row.success);
+      await this.notifyOwner(
+        [
+          `Публикация social draft завершена: ${item.title}`,
+          `Время: ${new Date().toISOString()}`,
+          `Успешно: ${successfulPlatforms.map((row) => row.platform).join(', ')}`,
+          failedPlatforms.length
+            ? `С ошибками: ${failedPlatforms.map((row) => `${row.platform}: ${row.message ?? 'unknown error'}`).join(' | ')}`
+            : 'Ошибок по платформам нет.',
+        ].join('\n'),
+      );
     } catch (error) {
       await this.prisma.socialPublication.update({
         where: { id: item.id },
@@ -513,6 +545,9 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
           lastError: error instanceof Error ? error.message : String(error),
         },
       });
+      await this.notifyOwner(
+        `Ошибка публикации social draft ${item.title}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     } finally {
       this.publishingSocial = false;
     }

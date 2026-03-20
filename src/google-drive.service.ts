@@ -234,7 +234,7 @@ export class GoogleDriveService implements DriveAssetStore {
     mimeType: string,
     bodyFactory: () => Readable,
   ): Promise<DriveAssetInfo> {
-    let lastError = 'unknown';
+    const errors: string[] = [];
     for (const client of await this.getDriveClients()) {
       try {
         const parentId = await this.resolveFolderId(client.drive, folderId);
@@ -259,12 +259,13 @@ export class GoogleDriveService implements DriveAssetStore {
           createdTime: created.createdTime ?? new Date().toISOString(),
         };
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${client.kind}: ${message}`);
         this.handleDriveClientFailure(client.kind, error);
       }
     }
 
-    throw new Error(`Cannot create file ${fileName}: ${lastError}`);
+    throw new Error(`Cannot create file ${fileName}: ${errors.join(' | ') || 'unknown'}`);
   }
 
   private async updateExistingFile(
@@ -273,7 +274,7 @@ export class GoogleDriveService implements DriveAssetStore {
     mimeType: string,
     bodyFactory: () => Readable,
   ): Promise<DriveAssetInfo> {
-    let lastError = 'unknown';
+    const errors: string[] = [];
     for (const client of await this.getClientsByPriority(fileId)) {
       try {
         const response = await client.drive.files.update({
@@ -294,12 +295,13 @@ export class GoogleDriveService implements DriveAssetStore {
           createdTime: updated.createdTime ?? new Date().toISOString(),
         };
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${client.kind}: ${message}`);
         this.handleDriveClientFailure(client.kind, error);
       }
     }
 
-    throw new Error(`Cannot update file ${fileName}: ${lastError}`);
+    throw new Error(`Cannot update file ${fileName}: ${errors.join(' | ') || 'unknown'}`);
   }
 
   private async findFileByName(folderId: string, fileName: string): Promise<DriveAssetInfo | null> {
@@ -495,8 +497,6 @@ export class GoogleDriveService implements DriveAssetStore {
     const clientId = this.clean(process.env.GOOGLE_DRIVE_CLIENT_ID);
     const clientSecret = this.clean(process.env.GOOGLE_DRIVE_CLIENT_SECRET);
     const refreshToken = this.clean(process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
-    const accessToken = this.clean(process.env.GOOGLE_DRIVE_ACCESS_TOKEN);
-
     if (!clientId || !clientSecret || !refreshToken) {
       throw new Error('Google Drive OAuth credentials are missing');
     }
@@ -504,7 +504,6 @@ export class GoogleDriveService implements DriveAssetStore {
     const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
     oauth2.setCredentials({
       refresh_token: refreshToken,
-      access_token: accessToken,
     });
 
     try {

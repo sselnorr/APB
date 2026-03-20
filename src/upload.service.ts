@@ -3,7 +3,7 @@ import { basename } from 'node:path';
 import { readFile, stat } from 'node:fs/promises';
 import { AppConfigService } from './app.config';
 import { PublisherAdapter } from './domain/interfaces';
-import { truncate } from './utils/text';
+import { normalizeVideoDescription, truncate } from './utils/text';
 
 export interface VideoPublishPayload {
   videoUrl: string;
@@ -34,14 +34,28 @@ export class UploadService implements PublisherAdapter<VideoPublishPayload, Vide
       throw new Error('Upload-Post credentials are missing');
     }
 
+    const description = normalizeVideoDescription(payload.description);
+    const firstComment = this.appConfig.uploadVideoFirstComment;
     const form = new FormData();
     form.append('video', payload.videoUrl);
     form.append('title', payload.title);
-    form.append('description', payload.description);
+    form.append('description', description);
+    form.append('tiktok_title', description);
+    form.append('instagram_title', description);
     form.append('youtube_title', payload.title);
-    form.append('youtube_description', payload.description);
-    form.append('instagram_title', payload.title);
+    form.append('youtube_description', description);
+    form.append('instagram_first_comment', firstComment);
+    form.append('youtube_first_comment', firstComment);
     form.append('media_type', 'REELS');
+    form.append('share_to_feed', 'true');
+    form.append('privacy_level', 'PUBLIC_TO_EVERYONE');
+    form.append('privacyStatus', 'public');
+    form.append('post_mode', 'DIRECT_POST');
+    form.append('selfDeclaredMadeForKids', 'false');
+    form.append('containsSyntheticMedia', 'false');
+    form.append('defaultLanguage', 'ru');
+    form.append('defaultAudioLanguage', 'ru-RU');
+    form.append('is_aigc', 'false');
     form.append('user', this.appConfig.uploadPostUsername as string);
     form.append('username', this.appConfig.uploadPostUsername as string);
     form.append('async_upload', 'true');
@@ -167,9 +181,9 @@ export class UploadService implements PublisherAdapter<VideoPublishPayload, Vide
 
   private deferredNotes(): string[] {
     return [
-      'Library music selection is deferred because Upload-Post public docs do not expose that capability.',
+      'Licensed library music selection remains deferred because Upload-Post public docs do not expose that capability.',
       'Undocumented editor-only switches are not auto-applied.',
-      'Made-for-kids and synthetic-media flags stay deferred until exact documented field names are confirmed in the target API.',
+      'Instagram library music cannot be selected via API; only the original embedded audio can be named.',
     ];
   }
 
