@@ -33,6 +33,9 @@ const DEFAULT_IMAGE_PROMPT = [
   'Опиши композицию, стиль и ключевой визуальный акцент.',
 ].join('\n');
 
+const DEFAULT_UPLOAD_VIDEO_FIRST_COMMENT =
+  'Друзья, спасибо что смотрите мой контент! Проявите активность на моих видео, тем самым вы поддержите мои старания 🤗 ';
+
 @Injectable()
 export class AppConfigService {
   constructor(private readonly config: ConfigService) {}
@@ -122,6 +125,22 @@ export class AppConfigService {
 
   get uploadPlatforms(): string[] {
     const raw = this.clean('UPLOAD_POST_PLATFORMS') ?? 'youtube,instagram,tiktok';
+    return raw
+      .split(',')
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  get uploadVideoFirstComment(): string {
+    return this.clean('UPLOAD_POST_VIDEO_FIRST_COMMENT') ?? DEFAULT_UPLOAD_VIDEO_FIRST_COMMENT;
+  }
+
+  get uploadSocialProfile(): string {
+    return this.clean('UPLOAD_POST_SOCIAL_PROFILE') ?? 'crypto_text';
+  }
+
+  get uploadSocialPlatforms(): string[] {
+    const raw = this.clean('UPLOAD_POST_SOCIAL_PLATFORMS') ?? 'x,threads,facebook';
     return raw
       .split(',')
       .map((item) => item.trim().toLowerCase())

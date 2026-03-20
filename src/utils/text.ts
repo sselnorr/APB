@@ -31,3 +31,41 @@ export function truncate(value: string, max: number): string {
   }
   return `${value.slice(0, max)}...`;
 }
+
+export function normalizeVideoDescription(value: string): string {
+  const normalized = value.replace(/\r\n/g, '\n').trim();
+  if (!normalized) {
+    return normalized;
+  }
+
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const hashtags: string[] = [];
+  const textLines: string[] = [];
+  for (const line of lines) {
+    const matches = line.match(/#[\p{L}\p{N}_]+/gu) ?? [];
+    for (const tag of matches) {
+      if (!hashtags.includes(tag)) {
+        hashtags.push(tag);
+      }
+    }
+
+    const cleaned = line
+      .replace(/#[\p{L}\p{N}_]+/gu, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    if (cleaned) {
+      textLines.push(cleaned);
+    }
+  }
+
+  if (!hashtags.length) {
+    return textLines.join('\n');
+  }
+
+  return `${textLines.join('\n')}\n\n${hashtags.join(' ')}`.trim();
+}
