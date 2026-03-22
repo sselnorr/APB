@@ -124,11 +124,23 @@ export class AppConfigService {
   }
 
   get uploadPlatforms(): string[] {
-    const raw = this.clean('UPLOAD_POST_PLATFORMS') ?? 'youtube,instagram,tiktok';
-    return raw
+    const raw = (this.clean('UPLOAD_POST_PLATFORMS') ?? 'youtube,instagram,tiktok')
       .split(',')
       .map((item) => item.trim().toLowerCase())
       .filter(Boolean);
+
+    return raw.filter((platform) => {
+      if (platform === 'youtube') {
+        return this.youtubeEnabled;
+      }
+      if (platform === 'instagram') {
+        return this.reelsEnabled;
+      }
+      if (platform === 'tiktok') {
+        return this.tiktokEnabled;
+      }
+      return true;
+    });
   }
 
   get uploadVideoFirstComment(): string {
@@ -140,11 +152,67 @@ export class AppConfigService {
   }
 
   get uploadSocialPlatforms(): string[] {
-    const raw = this.clean('UPLOAD_POST_SOCIAL_PLATFORMS') ?? 'x,threads,facebook';
-    return raw
+    const raw = (this.clean('UPLOAD_POST_SOCIAL_PLATFORMS') ?? 'x,threads,facebook')
       .split(',')
       .map((item) => item.trim().toLowerCase())
       .filter(Boolean);
+
+    return raw.filter((platform) => {
+      if (platform === 'x') {
+        return this.xEnabled;
+      }
+      if (platform === 'threads') {
+        return this.threadsEnabled;
+      }
+      if (platform === 'facebook') {
+        return this.facebookEnabled;
+      }
+      return true;
+    });
+  }
+
+  get youtubeEnabled(): boolean {
+    return this.flag('YOUTUBE');
+  }
+
+  get reelsEnabled(): boolean {
+    return this.flag('REELS');
+  }
+
+  get tiktokEnabled(): boolean {
+    return this.flag('TIKTOK');
+  }
+
+  get xEnabled(): boolean {
+    return this.flag('X');
+  }
+
+  get threadsEnabled(): boolean {
+    return this.flag('THREADS');
+  }
+
+  get facebookEnabled(): boolean {
+    return this.flag('FACEBOOK');
+  }
+
+  get videoDescriptionEnabled(): boolean {
+    return this.flag('VIDEO_DESCRIPTION');
+  }
+
+  get telegramDraftEnabled(): boolean {
+    return this.flag('TELEGRAM_DRAFT');
+  }
+
+  get socialDraftEnabled(): boolean {
+    return this.flag('SOCIAL_DRAFT');
+  }
+
+  get postVideoFirstCommentEnabled(): boolean {
+    return this.flag('POST_VIDEO_FIRST_COMMENT');
+  }
+
+  get generateSocialImageEnabled(): boolean {
+    return this.flag('GENERATE_SOCIAL_IMAGE');
   }
 
   get videoPrompt(): string {
@@ -167,6 +235,10 @@ export class AppConfigService {
     return normalizePrompt(this.clean('PROMPT_IMAGE_PROMPT'), DEFAULT_IMAGE_PROMPT);
   }
 
+  get articleClusterEnabled(): boolean {
+    return this.flag('ARTICLE_CLUSTER');
+  }
+
   get articleSources(): ArticleSourceConfig[] {
     const raw = this.clean('ARTICLE_SOURCES_JSON');
     if (!raw) {
@@ -185,7 +257,10 @@ export class AppConfigService {
       const row = item as Record<string, unknown>;
       const name = typeof row.name === 'string' ? row.name.trim() : '';
       const url = typeof row.url === 'string' ? row.url.trim() : '';
-      const type = row.type === 'html' ? 'html' : 'rss';
+      const type =
+        row.type === 'html' || row.type === 'telegram' || row.type === 'x'
+          ? row.type
+          : 'rss';
       if (!name || !url) {
         throw new Error(`ARTICLE_SOURCES_JSON[${index}] must include name and url`);
       }
@@ -221,5 +296,20 @@ export class AppConfigService {
       throw new Error(`${key} is required`);
     }
     return value;
+  }
+
+  private flag(key: string, fallback = true): boolean {
+    const value = this.clean(key);
+    if (!value) {
+      return fallback;
+    }
+    const normalized = value.toLowerCase();
+    if (['on', 'true', '1', 'yes'].includes(normalized)) {
+      return true;
+    }
+    if (['off', 'false', '0', 'no'].includes(normalized)) {
+      return false;
+    }
+    return fallback;
   }
 }

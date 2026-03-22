@@ -33,7 +33,11 @@ export class SocialPublisherService
   ) {}
 
   isConfigured(): boolean {
-    return Boolean(this.appConfig.uploadPostApiKey && this.appConfig.uploadSocialProfile);
+    return Boolean(
+      this.appConfig.uploadPostApiKey &&
+      this.appConfig.uploadSocialProfile &&
+      this.appConfig.uploadSocialPlatforms.length,
+    );
   }
 
   async publish(payload: SocialPublishPayload): Promise<SocialPublishResult> {
@@ -41,7 +45,7 @@ export class SocialPublisherService
       throw new Error('Upload-Post social publisher is not configured');
     }
     if (!payload.imageFileId) {
-      throw new Error('imageFileId is required for social publication');
+      return this.publishText(payload);
     }
 
     const imagePath = await this.drive.downloadFile(
@@ -95,6 +99,43 @@ export class SocialPublisherService
     } finally {
       await unlink(imagePath).catch(() => undefined);
     }
+  }
+
+  private async publishText(payload: SocialPublishPayload): Promise<SocialPublishResult> {
+    const form = new FormData();
+    form.append('user', this.appConfig.uploadSocialProfile);
+    form.append('title', payload.body);
+    form.append('description', payload.body);
+    form.append('facebook_title', payload.body);
+    form.append('x_title', payload.body);
+    form.append('threads_title', payload.body);
+    form.append('async_upload', 'true');
+
+    for (const platform of this.appConfig.uploadSocialPlatforms) {
+      form.append('platform[]', platform);
+    }
+
+    const response = await fetch('https://api.upload-post.com/api/upload_text', {
+      method: 'POST',
+      headers: {
+        Authorization: `Apikey ${this.appConfig.uploadPostApiKey}`,
+      },
+      body: form,
+    });
+
+    const raw = await response.text();
+    this.logger.log(`Upload-Post social text init response: status=${response.status} body=${truncate(raw, 800)}`);
+    if (!response.ok) {
+      throw new Error(`Upload-Post social text upload failed ${response.status}: ${raw}`);
+    }
+
+    const parsed = this.tryParseJson(raw);
+    const requestId = typeof parsed?.request_id === 'string' ? parsed.request_id : undefined;
+    if (!requestId) {
+      return this.buildResult(parsed, raw);
+    }
+
+    return this.pollAsyncStatus(requestId);
   }
 
   private async pollAsyncStatus(requestId: string): Promise<SocialPublishResult> {

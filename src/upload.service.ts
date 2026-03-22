@@ -26,7 +26,11 @@ export class UploadService implements PublisherAdapter<VideoPublishPayload, Vide
   constructor(private readonly appConfig: AppConfigService) {}
 
   isConfigured(): boolean {
-    return Boolean(this.appConfig.uploadPostApiKey && this.appConfig.uploadPostUsername);
+    return Boolean(
+      this.appConfig.uploadPostApiKey &&
+      this.appConfig.uploadPostUsername &&
+      this.appConfig.uploadPlatforms.length,
+    );
   }
 
   async publish(payload: VideoPublishPayload): Promise<VideoPublishResult> {
@@ -35,7 +39,6 @@ export class UploadService implements PublisherAdapter<VideoPublishPayload, Vide
     }
 
     const description = normalizeVideoDescription(payload.description);
-    const firstComment = this.appConfig.uploadVideoFirstComment;
     const form = new FormData();
     form.append('video', payload.videoUrl);
     form.append('title', payload.title);
@@ -44,8 +47,11 @@ export class UploadService implements PublisherAdapter<VideoPublishPayload, Vide
     form.append('instagram_title', description);
     form.append('youtube_title', payload.title);
     form.append('youtube_description', description);
-    form.append('instagram_first_comment', firstComment);
-    form.append('youtube_first_comment', firstComment);
+    if (this.appConfig.postVideoFirstCommentEnabled) {
+      const firstComment = this.appConfig.uploadVideoFirstComment;
+      form.append('instagram_first_comment', firstComment);
+      form.append('youtube_first_comment', firstComment);
+    }
     form.append('media_type', 'REELS');
     form.append('share_to_feed', 'true');
     form.append('privacy_level', 'PUBLIC_TO_EVERYONE');

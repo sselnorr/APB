@@ -32,6 +32,7 @@ export class TelegramBotService {
   private polling = false;
   private pollingAbort = false;
   private updateOffset = 0;
+  private pollingFailureCount = 0;
 
   constructor(private readonly appConfig: AppConfigService) {}
 
@@ -223,6 +224,7 @@ export class TelegramBotService {
           timeout: 15,
           allowed_updates: ['message', 'callback_query'],
         })) as Array<any>;
+        this.pollingFailureCount = 0;
 
         for (const update of updates) {
           this.updateOffset = Math.max(this.updateOffset, (update.update_id as number) + 1);
@@ -230,12 +232,17 @@ export class TelegramBotService {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        this.pollingFailureCount += 1;
         if (message.includes('409')) {
           this.logger.warn('Telegram polling conflict (409). Another session is active.');
+        } else if (this.isTransientPollingError(message)) {
+          this.logger.warn(
+            `Telegram polling transient error (${this.pollingFailureCount}): ${message}`,
+          );
         } else {
           this.logger.error(`Telegram polling error: ${message}`);
         }
-        await new Promise((resolve) => setTimeout(resolve, 3000));
+        await new Promise((resolve) => setTimeout(resolve, this.pollingBackoffMs()));
       }
     }
 
@@ -318,5 +325,24 @@ export class TelegramBotService {
     if (callbackQuery.id) {
       await this.bot?.telegram.answerCbQuery(callbackQuery.id).catch(() => undefined);
     }
+  }
+
+  private isTransientPollingError(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes('502') ||
+      normalized.includes('503') ||
+      normalized.includes('504') ||
+      normalized.includes('bad gateway') ||
+      normalized.includes('gateway timeout') ||
+      normalized.includes('fetch failed') ||
+      normalized.includes('econnreset') ||
+      normalized.includes('etimedout') ||
+      normalized.includes('socket hang up')
+    );
+  }
+
+  private pollingBackoffMs(): number {
+    return Math.min(30_000, 3_000 * Math.max(1, this.pollingFailureCount));
   }
 }

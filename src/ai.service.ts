@@ -108,48 +108,35 @@ export class AiService implements ImageGeneratorAdapter {
   }
 
   async generateTelegramDraft(summary: string, sourceUrls: string[]): Promise<DraftContent> {
-    const response = await this.chatJson([
-      { role: 'system', content: this.appConfig.telegramDraftPrompt },
-      {
-        role: 'user',
-        content: `Summary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
-      },
-    ]);
-
-    return {
-      title: response.title?.trim() || 'Telegram Draft',
-      body: response.body?.trim() || summary,
-    };
+    return this.generateTelegramDraftFromContext('Summary', summary, sourceUrls);
   }
 
-  async rewriteTelegramDraft(currentBody: string, summary: string, sourceUrls: string[]): Promise<DraftContent> {
-    const response = await this.chatJson([
-      { role: 'system', content: this.appConfig.telegramDraftPrompt },
-      {
-        role: 'user',
-        content: `Перепиши пост по той же теме иначе.\n\nТекущий текст:\n${currentBody}\n\nSummary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
-      },
-    ]);
-
-    return {
-      title: response.title?.trim() || 'Telegram Draft',
-      body: response.body?.trim() || currentBody,
-    };
+  async generateTelegramDraftFromOriginal(
+    title: string,
+    body: string,
+    sourceUrls: string[],
+  ): Promise<DraftContent> {
+    return this.generateTelegramDraftFromContext(
+      'Оригинальный материал',
+      `Заголовок: ${title}\n\nТекст источника:\n${truncate(body, 6_000)}`,
+      sourceUrls,
+    );
   }
 
   async generateSocialDraft(summary: string, sourceUrls: string[]): Promise<DraftContent> {
-    const response = await this.chatJson([
-      { role: 'system', content: this.appConfig.socialDraftPrompt },
-      {
-        role: 'user',
-        content: `Summary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
-      },
-    ]);
+    return this.generateSocialDraftFromContext('Summary', summary, sourceUrls);
+  }
 
-    return {
-      title: response.title?.trim() || 'Social Draft',
-      body: response.body?.trim() || summary,
-    };
+  async generateSocialDraftFromOriginal(
+    title: string,
+    body: string,
+    sourceUrls: string[],
+  ): Promise<DraftContent> {
+    return this.generateSocialDraftFromContext(
+      'Оригинальный материал',
+      `Заголовок: ${title}\n\nТекст источника:\n${truncate(body, 6_000)}`,
+      sourceUrls,
+    );
   }
 
   async generateImagePrompt(summary: string, socialBody: string): Promise<string> {
@@ -183,6 +170,59 @@ export class AiService implements ImageGeneratorAdapter {
     return {
       mimeType: 'image/png',
       bytes: Buffer.from(b64, 'base64'),
+    };
+  }
+
+  private async generateTelegramDraftFromContext(
+    label: string,
+    context: string,
+    sourceUrls: string[],
+  ): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.telegramDraftPrompt },
+      {
+        role: 'user',
+        content: `${label}:\n${context}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Telegram Draft',
+      body: response.body?.trim() || context,
+    };
+  }
+
+  async rewriteTelegramDraft(currentBody: string, summary: string, sourceUrls: string[]): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.telegramDraftPrompt },
+      {
+        role: 'user',
+        content: `Перепиши пост по той же теме иначе.\n\nТекущий текст:\n${currentBody}\n\nSummary:\n${summary}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Telegram Draft',
+      body: response.body?.trim() || currentBody,
+    };
+  }
+
+  private async generateSocialDraftFromContext(
+    label: string,
+    context: string,
+    sourceUrls: string[],
+  ): Promise<DraftContent> {
+    const response = await this.chatJson([
+      { role: 'system', content: this.appConfig.socialDraftPrompt },
+      {
+        role: 'user',
+        content: `${label}:\n${context}\n\nИсточники:\n${sourceUrls.join('\n')}\n\nВерни JSON { "title": "...", "body": "..." }`,
+      },
+    ]);
+
+    return {
+      title: response.title?.trim() || 'Social Draft',
+      body: response.body?.trim() || context,
     };
   }
 
