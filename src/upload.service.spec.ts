@@ -27,6 +27,7 @@ describe('UploadService', () => {
       uploadPostApiKey: 'key',
       uploadPostUsername: 'video_profile',
       uploadPlatforms: ['tiktok', 'instagram', 'youtube'],
+      postVideoFirstCommentEnabled: true,
       uploadVideoFirstComment:
         'Друзья, спасибо что смотрите мой контент! Проявите активность на моих видео, тем самым вы поддержите мои старания 🤗 ',
     } as any);

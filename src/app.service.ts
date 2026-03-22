@@ -60,6 +60,7 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
 
     await this.telegram.start();
     await this.verifyFfmpeg();
+    this.logFeatureFlags();
 
     if (!this.dbReady) {
       return;
@@ -141,6 +142,9 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async processNextVideo(): Promise<void> {
+    if (!this.appConfig.videoDescriptionEnabled) {
+      return;
+    }
     if (this.processingVideo) {
       return;
     }
@@ -353,6 +357,16 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      if (!this.appConfig.telegramDraftEnabled && !this.appConfig.socialDraftEnabled) {
+        this.logger.log('Article drafts are disabled by feature flags; new articles were stored without draft generation');
+        return;
+      }
+
+      if (!this.appConfig.articleClusterEnabled) {
+        await this.createOriginalSourceDrafts(newRecords);
+        return;
+      }
+
       const clusterDto = await this.ai.buildCluster(newRecords);
       const cluster = await this.prisma.contentCluster.create({
         data: {
@@ -379,13 +393,50 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async createOriginalSourceDrafts(records: ArticleRecord[]): Promise<void> {
+    for (const record of records) {
+      const sourceUrls = [record.canonicalUrl];
+      const summary = truncate(record.bodyText?.trim() || record.excerpt?.trim() || record.title, 6_000);
+      const cluster = await this.prisma.contentCluster.create({
+        data: {
+          title: record.title,
+          summary,
+          sourceUrlsJson: JSON.stringify(sourceUrls),
+          articleIdsJson: JSON.stringify([record.id]),
+          fingerprint: sha256(`original|${record.dedupeKey}`),
+        },
+      });
+
+      await this.prisma.articleRecord.update({
+        where: { id: record.id },
+        data: { clusterId: cluster.id },
+      });
+
+      await this.createTelegramDraft(cluster.id, record.title, summary, sourceUrls, {
+        sourceTitle: record.title,
+        sourceBody: summary,
+      });
+      await this.createSocialDraft(cluster.id, record.title, summary, sourceUrls, {
+        sourceTitle: record.title,
+        sourceBody: summary,
+      });
+    }
+  }
+
   private async createTelegramDraft(
     clusterId: string,
     clusterTitle: string,
     summary: string,
     sourceUrls: string[],
+    original?: { sourceTitle: string; sourceBody: string },
   ): Promise<void> {
-    const draft = await this.ai.generateTelegramDraft(summary, sourceUrls);
+    if (!this.appConfig.telegramDraftEnabled) {
+      return;
+    }
+
+    const draft = original
+      ? await this.ai.generateTelegramDraftFromOriginal(original.sourceTitle, original.sourceBody, sourceUrls)
+      : await this.ai.generateTelegramDraft(summary, sourceUrls);
     const stem = this.makeStem(clusterTitle, clusterId);
     const textAsset = await this.drive.upsertTelegramDraftText(stem, draft.body);
 
@@ -426,9 +477,18 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
     clusterTitle: string,
     summary: string,
     sourceUrls: string[],
+    original?: { sourceTitle: string; sourceBody: string },
   ): Promise<void> {
-    const socialDraft = await this.ai.generateSocialDraft(summary, sourceUrls);
-    const imagePrompt = await this.ai.generateImagePrompt(summary, socialDraft.body);
+    if (!this.appConfig.socialDraftEnabled) {
+      return;
+    }
+
+    const socialDraft = original
+      ? await this.ai.generateSocialDraftFromOriginal(original.sourceTitle, original.sourceBody, sourceUrls)
+      : await this.ai.generateSocialDraft(summary, sourceUrls);
+    const imagePrompt = this.appConfig.generateSocialImageEnabled
+      ? await this.ai.generateImagePrompt(summary, socialDraft.body)
+      : null;
     const stem = this.makeStem(clusterTitle, clusterId);
     const textAsset = await this.drive.upsertWrittenText(stem, socialDraft.body);
     let imageAssetId: string | undefined;
@@ -438,17 +498,17 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
       : SocialPublicationStatus.AWAITING_EXTERNAL_API_CONFIG;
     let lastError: string | null = null;
 
-    if (this.ai.isConfigured()) {
+    if (this.appConfig.generateSocialImageEnabled && this.ai.isConfigured() && imagePrompt) {
       const generated = await this.ai.generate(imagePrompt);
       const imageAsset = await this.drive.uploadWrittenImage(stem, generated.bytes, generated.mimeType);
       imageAssetId = imageAsset.id;
       imageMimeType = generated.mimeType;
-    } else {
+    } else if (this.appConfig.generateSocialImageEnabled) {
       status = SocialPublicationStatus.FAILED;
       lastError = 'Image generation is not configured';
     }
 
-    if (!imageAssetId) {
+    if (this.appConfig.generateSocialImageEnabled && !imageAssetId) {
       status = SocialPublicationStatus.FAILED;
       lastError = lastError ?? 'Social publication image was not generated';
     }
@@ -931,5 +991,23 @@ export class AppService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`${label} failed: ${message}`);
       await this.notifyOwner(`${label} failed: ${message}`);
     }
+  }
+
+  private logFeatureFlags(): void {
+    const flags = [
+      `YOUTUBE=${this.appConfig.youtubeEnabled ? 'on' : 'off'}`,
+      `REELS=${this.appConfig.reelsEnabled ? 'on' : 'off'}`,
+      `TIKTOK=${this.appConfig.tiktokEnabled ? 'on' : 'off'}`,
+      `X=${this.appConfig.xEnabled ? 'on' : 'off'}`,
+      `THREADS=${this.appConfig.threadsEnabled ? 'on' : 'off'}`,
+      `FACEBOOK=${this.appConfig.facebookEnabled ? 'on' : 'off'}`,
+      `VIDEO_DESCRIPTION=${this.appConfig.videoDescriptionEnabled ? 'on' : 'off'}`,
+      `ARTICLE_CLUSTER=${this.appConfig.articleClusterEnabled ? 'on' : 'off'}`,
+      `TELEGRAM_DRAFT=${this.appConfig.telegramDraftEnabled ? 'on' : 'off'}`,
+      `SOCIAL_DRAFT=${this.appConfig.socialDraftEnabled ? 'on' : 'off'}`,
+      `GENERATE_SOCIAL_IMAGE=${this.appConfig.generateSocialImageEnabled ? 'on' : 'off'}`,
+      `POST_VIDEO_FIRST_COMMENT=${this.appConfig.postVideoFirstCommentEnabled ? 'on' : 'off'}`,
+    ];
+    this.logger.log(`Feature flags: ${flags.join(', ')}`);
   }
 }

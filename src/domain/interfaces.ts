@@ -1,7 +1,7 @@
 export interface ArticleSourceConfig {
   name: string;
   url: string;
-  type: 'rss' | 'html';
+  type: 'rss' | 'html' | 'telegram' | 'x';
 }
 
 export interface ContentClusterDto {
