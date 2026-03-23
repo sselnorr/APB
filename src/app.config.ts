@@ -257,14 +257,10 @@ export class AppConfigService {
       const row = item as Record<string, unknown>;
       const name = typeof row.name === 'string' ? row.name.trim() : '';
       const url = typeof row.url === 'string' ? row.url.trim() : '';
-      const type =
-        row.type === 'html' || row.type === 'telegram' || row.type === 'x'
-          ? row.type
-          : 'rss';
       if (!name || !url) {
         throw new Error(`ARTICLE_SOURCES_JSON[${index}] must include name and url`);
       }
-      return { name, url, type };
+      return { name, url, type: this.resolveArticleSourceType(row.type, url) };
     });
   }
 
@@ -311,5 +307,25 @@ export class AppConfigService {
       return false;
     }
     return fallback;
+  }
+
+  private resolveArticleSourceType(rawType: unknown, url: string): ArticleSourceConfig['type'] {
+    if (rawType === 'html' || rawType === 'telegram' || rawType === 'x') {
+      return rawType;
+    }
+    if (rawType === 'rss') {
+      try {
+        const hostname = new URL(url).hostname.toLowerCase();
+        if (hostname === 't.me' || hostname.endsWith('.t.me')) {
+          return 'telegram';
+        }
+        if (hostname === 'x.com' || hostname === 'twitter.com' || hostname === 'www.x.com' || hostname === 'www.twitter.com') {
+          return 'x';
+        }
+      } catch {
+        return 'rss';
+      }
+    }
+    return 'rss';
   }
 }
