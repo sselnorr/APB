@@ -41,7 +41,7 @@ export class ArticlePipelineService {
   private async fetchSource(source: ArticleSourceConfig): Promise<FetchedArticle[]> {
     switch (source.type) {
       case 'rss':
-        return this.fetchRssSource(source);
+        return this.fetchRssSourceWithFallback(source);
       case 'telegram':
         return this.fetchTelegramSource(source);
       case 'x':
@@ -49,6 +49,23 @@ export class ArticlePipelineService {
       case 'html':
       default:
         return this.fetchHtmlSource(source);
+    }
+  }
+
+  private async fetchRssSourceWithFallback(source: ArticleSourceConfig): Promise<FetchedArticle[]> {
+    try {
+      return await this.fetchRssSource(source);
+    } catch (error) {
+      if (!this.looksLikeTelegramUrl(source.url)) {
+        throw error;
+      }
+      this.logger.warn(
+        `RSS parsing failed for Telegram-like source ${source.name}; retrying as Telegram HTML feed`,
+      );
+      return this.fetchTelegramSource({
+        ...source,
+        type: 'telegram',
+      });
     }
   }
 
@@ -99,7 +116,13 @@ export class ArticlePipelineService {
   }
 
   private async fetchTelegramSource(source: ArticleSourceConfig): Promise<FetchedArticle[]> {
-    const { html } = await this.fetchPage(source.url);
+    const telegramUrl = this.toTelegramWebViewUrl(source.url);
+    if (!telegramUrl) {
+      this.logger.warn(`Telegram source ${source.name} is not publicly readable via web view: ${source.url}`);
+      return [];
+    }
+
+    const { html } = await this.fetchPage(telegramUrl);
     const $ = cheerio.load(html);
     const results: FetchedArticle[] = [];
 
@@ -252,5 +275,40 @@ export class ArticlePipelineService {
       url.searchParams.delete(key);
     }
     return url.toString();
+  }
+
+  private looksLikeTelegramUrl(value: string): boolean {
+    try {
+      const url = new URL(value);
+      const hostname = url.hostname.toLowerCase();
+      return hostname === 't.me' || hostname.endsWith('.t.me');
+    } catch {
+      return false;
+    }
+  }
+
+  private toTelegramWebViewUrl(value: string): string | null {
+    try {
+      const url = new URL(value);
+      if (!this.looksLikeTelegramUrl(value)) {
+        return value;
+      }
+
+      const segments = url.pathname.split('/').filter(Boolean);
+      if (!segments.length) {
+        return value;
+      }
+      if (segments[0] === 'c') {
+        return null;
+      }
+      if (segments[0] === 's') {
+        return url.toString();
+      }
+
+      url.pathname = `/s/${segments.join('/')}`;
+      return url.toString();
+    } catch {
+      return value;
+    }
   }
 }
